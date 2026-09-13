@@ -35,6 +35,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 KEY = "00000000-0000-4000-8000-000000000000"
 
+# The longest completion the fake will produce. A real 35B on this hardware runs
+# at about 26 tok/s, so anything longer just makes a demo wait.
+TOKEN_CAP = 400
+# Measured prompt-processing rate from API.md, used for the timings block so the
+# prefill benchmark draws a real curve.
+PREFILL_TOK_S = 28.2
+# A pace for demos: fast enough to watch, slow enough that streaming looks like
+# streaming and the concurrency queue is visible. Tests leave it at 0.
+DEMO_TOKEN_DELAY = 0.012
+# time.sleep cannot pace individual tokens: asked for 12 ms it can take 100, so
+# eighty per-token sleeps turned a one second answer into eight. Pacing runs off
+# a deadline instead and only sleeps when at least this much is owed, which
+# makes tokens arrive in small bursts and keeps the total honest.
+MIN_SLEEP = 0.05
+# Pause between download progress frames in demo mode, so the bar can be seen.
+DEMO_DOWNLOAD_STEP = 0.4
+
 # Unit costs are the measured ones from CAPABILITIES.md.
 CATALOG = [
     {"model_id": "deepreinforce-ai/Ornith-1.0-35B", "type": "Image-Text-to-Text",
@@ -63,9 +80,25 @@ DEFAULT_INSTALLED = ["deepreinforce-ai/Ornith-1.0-35B",
                      "Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo",
                      "Qwen/Qwen3-Embedding-0.6B"]
 
-SAMPLE = ("Memory bandwidth sets the ceiling here. The accelerator reads the "
-          "active weights once per token, so tokens per second is bandwidth "
-          "divided by bytes read, and nothing in the scheduler changes that. ")
+# Filler for the fake's answers. Long and varied enough that a few hundred
+# tokens of it reads like prose rather than one sentence on a loop, which
+# matters because these answers end up in screenshots.
+SAMPLE = (
+    "Memory bandwidth sets the ceiling here. The accelerator reads the active "
+    "weights once per token, so tokens per second is bandwidth divided by bytes "
+    "read per token, and no amount of scheduling changes that arithmetic. "
+    "Adding a second caller does not add throughput, because the two requests "
+    "are not batched: they are queued, and the queue is in the runtime rather "
+    "than in the API layer, so it cannot be tuned away from the outside. "
+    "What does move the number is the shape of the model. A mixture of experts "
+    "reads only its active parameters for each token, so a larger model with a "
+    "small active set can decode faster than a smaller dense one. "
+    "The practical consequences are worth stating plainly. Sequential pipelines "
+    "cost nothing extra, since the stages were going to run one at a time "
+    "anyway. Long single responses are the expensive case, and they are also "
+    "the case a per-request time limit will cut off first. Batched work for "
+    "several people at once is the case this silicon is worst at, and the one "
+    "worth moving somewhere else. ")
 
 
 class FakeState:
@@ -421,7 +454,10 @@ class FakeHandler(BaseHTTPRequestHandler):
                     self._sse({"model_id": model_id, "status": "downloading",
                                "progress": step * 25.0,
                                "speed_human": "42.0 MB/s"})
-                    time.sleep(state.token_delay)
+                    # Only pause when this fake is pacing itself for a demo, so
+                    # the progress bar is actually watchable. Tests get it instantly.
+                    if state.token_delay:
+                        time.sleep(DEMO_DOWNLOAD_STEP)
                 with state.guard:
                     if model_id not in state.installed:
                         state.installed.append(model_id)
@@ -467,15 +503,42 @@ class FakeHandler(BaseHTTPRequestHandler):
     def _tokens(self, body):
         want = int(body.get("max_tokens") or 64)
         words = SAMPLE.split()
-        return [words[i % len(words)] + " " for i in range(max(1, min(want, 96)))]
+        return [words[i % len(words)] + " " for i in range(max(1, min(want, TOKEN_CAP)))]
+
+    @staticmethod
+    def _prompt_tokens(body):
+        """Roughly four characters per token, counted off the real prompt.
+
+        A fixed number here would make the prefill-scaling benchmark draw a flat
+        line against prompts of wildly different lengths, which would look like
+        a broken measurement rather than a fake one.
+        """
+        chars = 0
+        for message in body.get("messages") or []:
+            content = message.get("content")
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        chars += len(part["text"])
+        return max(1, chars // 4)
+
+    def _pace(self, started, index):
+        """Hold token `index` back until its slot in the deadline arrives."""
+        delay = self.state.token_delay
+        if not delay:
+            return
+        owed = (started + index * delay) - time.time()
+        if owed >= MIN_SLEEP:
+            time.sleep(owed)
 
     def _chat_once(self, body, model_id):
         state = self.state
         tokens = self._tokens(body)
         started = time.time()
-        for _ in tokens:
-            if state.token_delay:
-                time.sleep(state.token_delay)
+        for index in range(len(tokens)):
+            self._pace(started, index + 1)
             if state.request_ceiling and time.time() - started > state.request_ceiling:
                 # The gateway ceiling: measured at 222.3s on real firmware after
                 # 580 tokens, with the client timeout still at 780s.
@@ -487,17 +550,20 @@ class FakeHandler(BaseHTTPRequestHandler):
                 return None
         text = "".join(tokens).strip()
         elapsed = max(time.time() - started, 0.001)
+        prompt_n = self._prompt_tokens(body)
+        # API.md records ~28 tok/s prompt processing on real firmware.
+        prompt_ms = round(prompt_n / PREFILL_TOK_S * 1000, 1)
         return self._send(200, {
             "id": "chatcmpl-fake-%d" % int(started),
             "object": "chat.completion", "created": int(started), "model": model_id,
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": text}}],
-            "usage": {"prompt_tokens": 24, "completion_tokens": len(tokens),
-                      "total_tokens": 24 + len(tokens),
+            "usage": {"prompt_tokens": prompt_n, "completion_tokens": len(tokens),
+                      "total_tokens": prompt_n + len(tokens),
                       "prompt_tokens_details": {"cached_tokens": 0}},
             # Real gateways return a timings block; tiiny-bench reads it.
-            "timings": {"prompt_n": 24, "prompt_ms": 850.0,
-                        "prompt_per_second": 28.2,
+            "timings": {"prompt_n": prompt_n, "prompt_ms": prompt_ms,
+                        "prompt_per_second": PREFILL_TOK_S,
                         "predicted_n": len(tokens),
                         "predicted_per_second": round(len(tokens) / elapsed, 2),
                         "predicted_per_token_ms": round(elapsed * 1000 / len(tokens), 2)}})
@@ -521,9 +587,10 @@ class FakeHandler(BaseHTTPRequestHandler):
             # Reasoning models split output: chain of thought lands in
             # reasoning_content and counts against max_tokens.
             self._sse(frame({"reasoning_content": "Checking the bandwidth math. "}))
-            for token in self._tokens(body):
-                if state.token_delay:
-                    time.sleep(state.token_delay)
+            started = time.time()
+            tokens = self._tokens(body)
+            for index, token in enumerate(tokens):
+                self._pace(started, index + 1)
                 self._sse(frame({"content": token}))
             self._sse(frame({}, finish="stop"))
             self.wfile.write(b"data: [DONE]\n\n")

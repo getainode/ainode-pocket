@@ -180,7 +180,12 @@ class TestKeyDiscovery(unittest.TestCase):
         import re
         pattern = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
                              r"[0-9a-f]{12}")
-        allowed = {"00000000-0000-4000-8000-000000000000"}  # the fake's key
+        # A tiinyverse profile id is a public identifier in a public URL, and the
+        # farm manifest is required to carry one. Drop those occurrences rather
+        # than allow-listing a bare UUID, so the same id pasted anywhere else
+        # still trips the guard.
+        public = re.compile(r"https://www\.tiinyverse\.com/users/[0-9a-fA-F-]{36}")
+        allowed = {"00000000-0000-4000-8000-000000000000"}  # the fake device's key
         offenders = []
         for folder, dirs, files in os.walk(ROOT):
             dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "docs")]
@@ -190,7 +195,8 @@ class TestKeyDiscovery(unittest.TestCase):
                     continue
                 path = os.path.join(folder, name)
                 with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                    for found in pattern.findall(handle.read()):
-                        if found not in allowed:
-                            offenders.append("%s: %s" % (name, found))
+                    text = public.sub("", handle.read())
+                for found in pattern.findall(text):
+                    if found not in allowed:
+                        offenders.append("%s: %s" % (name, found))
         self.assertEqual(offenders, [])

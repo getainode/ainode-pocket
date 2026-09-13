@@ -48,13 +48,13 @@ def lan_address():
         probe.close()
 
 
-def build_fleet(count, registry_path=None):
+def build_fleet(count, registry_path=None, token_delay=0.0):
     """A fleet of fake devices in this process, registered in a throwaway file.
 
     The fake registry never touches the real one, so --fake cannot bury a user's
     actual devices under demo entries.
     """
-    fakes = fake_mod.fleet_of(count)
+    fakes = fake_mod.fleet_of(count, token_delay=token_delay)
     path = registry_path or os.path.join(tempfile.mkdtemp(prefix="ainode-pocket-fake-"),
                                          "devices.json")
     fleet = Fleet(Registry(path))
@@ -67,7 +67,8 @@ def build_fleet(count, registry_path=None):
 
 def cmd_serve(args):
     if args.fake:
-        fleet, fakes = build_fleet(args.fake)
+        fleet, fakes = build_fleet(args.fake,
+                                   token_delay=fake_mod.DEMO_TOKEN_DELAY)
         print("%s\nfake mode: %d device(s) in this process, real devices untouched"
               % (BANNER, len(fakes)))
         for fake in fakes:

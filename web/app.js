@@ -534,7 +534,7 @@ function turn(who, cls) {
   return box;
 }
 
-function send(text) {
+function send(text, maxTokens) {
   if (chatBusy) return;
   var model = $('#chat-model').value;
   if (!model || $('#chat-model').disabled) return toast('no loaded model to ask', true);
@@ -549,7 +549,9 @@ function send(text) {
   chatBusy = true;
   $('#chat-send').disabled = true;
 
-  var body = { model: model, max_tokens: 700,
+  // Budget generously: a reasoning model spends this on chain of thought before
+  // it emits a single word of the answer, and a tight cap returns empty content.
+  var body = { model: model, max_tokens: maxTokens || 700,
                messages: [{ role: 'user', content: text }] };
   var streaming = $('#chat-stream').checked;
   var target = theirs.querySelector('.turn-body');
@@ -610,8 +612,11 @@ function send(text) {
           var delta = ((frame.choices || [{}])[0] || {}).delta || {};
           if (delta.reasoning_content) {
             if (!thinking) {
+              // Above the answer, because that is the order it was produced in
+              // and because reasoning tokens are spending the same max_tokens
+              // budget the answer needs.
               thinking = el('div', 'turn-think');
-              theirs.appendChild(thinking);
+              theirs.insertBefore(thinking, target);
             }
             thinking.textContent += delta.reasoning_content;
           }
@@ -677,7 +682,9 @@ function paintBenchRun(run) {
   if (run.state === 'running') text += '\n\nrunning, ' + run.elapsed_s + 's elapsed';
   if (run.state === 'error') text += '\n\nfailed: ' + run.error;
   log.textContent = text || 'starting';
-  log.scrollTop = log.scrollHeight;
+  // Follow a live run, but leave a finished one at the top where its header
+  // says which device and model produced the numbers.
+  log.scrollTop = run.state === 'running' ? log.scrollHeight : 0;
   if (run.state === 'running' && !benchPoll) {
     benchPoll = setInterval(function () {
       api('/api/bench').then(function (payload) {
@@ -759,12 +766,14 @@ function boot() {
     if (wanted && ['overview', 'models', 'chat', 'bench'].indexOf(wanted) !== -1) {
       show(wanted);
     }
-    // ?q= sends one real request on load. Handy for a demo or a screenshot:
-    // the answer below comes from the endpoint, not from a fixture.
+    // ?q= sends one real request on load, with an optional &max= token budget.
+    // Handy for a demo or a screenshot: the answer comes from the endpoint, not
+    // from a fixture.
     var question = params.get('q');
     if (question) {
       show('chat');
-      send(question);
+      if (params.get('stream') === '0') $('#chat-stream').checked = false;
+      send(question, parseInt(params.get('max'), 10) || 0);
     }
   });
   setInterval(function () {
