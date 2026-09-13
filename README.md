@@ -273,6 +273,21 @@ spec declares only as free-form objects, and `CAPABILITIES.md` for the measured
 behaviour and the NPU unit costs. Where a shape could not be sourced from a
 recording it is marked unverified in the code rather than guessed.
 
+### Five shapes that are not verified
+
+The specs declare these responses as free-form objects and no live body was
+captured, so they are inferred from adjacent evidence, marked `UNVERIFIED` at
+each site in `pocket/fake.py`, and read defensively by the code that consumes
+them.
+
+| Shape | What it is based on | What breaks if it is wrong |
+|---|---|---|
+| `POST /api/v1/models/{id}/download/stream`, the SSE frame body | the `get_progress` fields plus `speed_human`, a real `OpenAIModel` field | the download bar shows status text instead of a percentage; the download itself is unaffected |
+| `GET /api/v1/models/{id}/get_progress` | tiiny-hud reads `progress` and `status` off a live device and works, so this is second hand rather than guessed | the progress readout only |
+| `GET /device.json` on 39218 | `RUNBOOK.md` records what it returns in prose but not the field names | nothing: the serial lookup tries several spellings and falls back to the address |
+| `GET /api/v1/models/storage` | `RUNBOOK.md`'s description of a failed download's storage record | nothing in Pocket: disk usage is read from `/api/v1/sys/status` |
+| `devices[].temp_c` and `power_w` in `/api/v1/npu/status` | declared by the spec, never observed filled in | nothing: the card says the firmware reports no temperature, and shows real readings if any ever arrive |
+
 Work through this against a real device before trusting any of it:
 
 | # | Check | Expected |

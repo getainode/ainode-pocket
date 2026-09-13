@@ -92,6 +92,9 @@ def cmd_serve(args):
     if lan:
         print("  http://%s:%d/v1" % (lan, args.port))
     print("\nctrl+c to stop")
+    # Redirected stdout is block buffered, so a supervisor or a log file would
+    # otherwise show nothing at all until the process exits.
+    sys.stdout.flush()
     try:
         httpd.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
@@ -101,6 +104,11 @@ def cmd_serve(args):
         httpd.server_close()
         for fake in fakes:
             fake.stop()
+        if args.fake:
+            # The throwaway registry lives in a temp directory of its own.
+            # Leaving one behind on every demo run is litter.
+            import shutil
+            shutil.rmtree(os.path.dirname(fleet.registry.path), ignore_errors=True)
     return 0
 
 

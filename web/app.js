@@ -480,7 +480,18 @@ function download(modelId, cell, button) {
       toast(payload.error, true);
       return;
     }
-    var value = Number(payload.progress || 0);
+    // The frame body of the device's download stream is not in any recorded
+    // spec, so read it defensively: try the field names the progress endpoint
+    // uses, then the ones OpenAIModel declares, and fall back to showing
+    // whatever status text arrived rather than a bar stuck at zero.
+    var value = payload.progress;
+    if (value === undefined) value = payload.global_progress;
+    if (value === undefined) value = payload.stage_progress;
+    if (value === undefined) {
+      label.textContent = payload.status || payload.message || 'working';
+      return;
+    }
+    value = Number(value) || 0;
     fill.firstChild.style.width = value + '%';
     label.textContent = value.toFixed(0) + '%' +
       (payload.speed_human ? '  ' + payload.speed_human : '');

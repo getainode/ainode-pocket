@@ -1,6 +1,8 @@
 """A fake Tiiny, good enough to develop and test against with no hardware.
 
-Every response shape here comes from a recorded artefact, not from guesswork:
+Almost every response shape here comes from a recorded artefact rather than from
+guesswork. The five that could not be are listed at the bottom of this docstring
+and marked at each site:
 
   * /Users/sem/code/tiiny/spec-8800.json, the gateway's own OpenAPI document,
     for OpenAIModelList and OpenAIModel (required: name, fullname, size, params,
@@ -24,6 +26,28 @@ never met them is not tested:
 All three services share one port. The real device spreads them over 8800, 80
 and 39218, but the paths do not collide, so one listener is enough and it keeps
 the fake to a single address.
+
+UNVERIFIED SHAPES
+-----------------
+Five responses could not be sourced from a recording. The specs declare them as
+free-form objects and no live body was captured, so what is below is inferred
+from adjacent evidence and is marked UNVERIFIED at each site. Confirm each one
+against a real device before trusting it; the checklist in the README covers
+them.
+
+  1. POST /api/v1/models/{id}/download/stream, the SSE frame body. The spec
+     documents that the endpoint streams progress and says nothing about the
+     frame. Inferred from the get_progress fields plus speed_human, which is a
+     real OpenAIModel field.
+  2. GET /api/v1/models/{id}/get_progress. Free-form in the spec. The field
+     names come from tiiny-hud, which reads progress and status off it and
+     works, so this is second hand rather than guessed.
+  3. GET /device.json on 39218. RUNBOOK.md records that it returns identity,
+     serial, MAC addresses and USB topology, but not the field names.
+  4. GET /api/v1/models/storage. Free-form in the spec; the per-model fields
+     come from RUNBOOK.md's prose about a failed download's storage record.
+  5. instance_id in the running instances list. Invented for realism; nothing
+     in Pocket reads it.
 """
 from __future__ import annotations
 
@@ -160,6 +184,9 @@ class FakeState:
     def running_payload(self):
         instances = []
         for offset, model_id in enumerate(self.loaded):
+            # model_id, port and npu_usage are read off a live device by
+            # tiiny-hud. instance_id is UNVERIFIED: invented here, read by
+            # nothing.
             instances.append({"model_id": model_id, "port": 9098 + offset,
                               "npu_usage": self._cost(model_id),
                               "instance_id": "fake-%s-%d" % (self.serial, offset)})
@@ -208,6 +235,11 @@ class FakeState:
                 "network": "wifi"}
 
     def device_json_payload(self, host_port):
+        # UNVERIFIED: RUNBOOK.md records what this endpoint returns in prose
+        # (identity, serial, MAC addresses, USB topology) but no field names.
+        # pocket.device.identity() therefore tries several spellings of the
+        # serial and falls back to the address, so a different field name
+        # degrades instead of breaking.
         return {"device_name": self.name, "sn": self.serial,
                 "device_model": "Tiiny AI Pocket Lab", "tiiny_os": "0.1.33",
                 "addresses": {"lan": host_port, "usb": "172.17.7.177"},
@@ -227,6 +259,10 @@ class FakeState:
         return out
 
     def storage_payload(self):
+        # UNVERIFIED: free-form in the spec. The per-model fields come from
+        # RUNBOOK.md's description of a failed download's storage record
+        # (size_bytes, model_path, progress, error). Pocket reads disk usage
+        # from /api/v1/sys/status instead, so nothing depends on this.
         models = [{"model_id": m, "size_bytes": self._row(m)["size"],
                    "model_path": "/data/models/%s" % m, "progress": 100.0,
                    "error": None} for m in self.installed]
@@ -331,6 +367,9 @@ class FakeHandler(BaseHTTPRequestHandler):
         return self._send(404, {"code": 404, "msg": "Not Found"})
 
     def _progress(self, model_id):
+        # UNVERIFIED, second hand: the spec declares this response free-form.
+        # The status and progress field names come from tiiny-hud, which reads
+        # them off a live device and works.
         state = self.state
         with state.guard:
             job = state.downloads.get(model_id)
@@ -434,7 +473,14 @@ class FakeHandler(BaseHTTPRequestHandler):
                                 "progress": 0})
 
     def _download_stream(self, model_id):
-        """The SSE sibling. Real firmware streams progress for up to six hours."""
+        """The SSE sibling. Real firmware streams progress for up to six hours.
+
+        UNVERIFIED: the frame body is the largest guess in this file. The spec
+        documents only that the endpoint streams progress. These fields are the
+        get_progress ones plus speed_human, which is a real OpenAIModel field.
+        The browser reads progress defensively and falls back to showing the
+        status text, so an unexpected shape shows less rather than breaking.
+        """
         state = self.state
         with state.guard:
             already = model_id in state.installed
