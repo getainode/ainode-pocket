@@ -17,6 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests import FakeFleetCase
+from pocket import device as device_mod
 from pocket import fake as fake_mod
 from pocket.fleet import DeviceLock, Fleet, NoDevice, Registry, lock_identity, lock_path
 
@@ -217,6 +218,202 @@ class TestRouting(FakeFleetCase):
         with self.assertRaises(NoDevice) as caught:
             empty.route("anything")
         self.assertIn("no devices registered", str(caught.exception))
+
+
+class TestPlanes(unittest.TestCase):
+    """One box, several addresses.
+
+    A Tiiny answers on USB and Wi-Fi at the same time, each on its own
+    interface, and reports both in device.json. It has to register once, not
+    twice, and traffic should prefer the USB link because it is a fixed
+    point-to-point /30 while the LAN address is DHCP.
+    """
+
+    def test_planes_are_read_from_the_device_s_own_address_list(self):
+        payload = {"serial_number": "TNY1", "device_name": "one",
+                   "ipv4_addresses": [{"interface": "usb0", "address": "172.17.7.177"},
+                                      {"interface": "wlan0", "address": "192.168.100.94"}]}
+        planes = device_mod.planes_from(payload)
+        self.assertEqual([p.name for p in planes], ["usb", "lan"])
+        self.assertEqual(planes[0].address, "172.17.7.177")
+        self.assertEqual(planes[1].address, "192.168.100.94")
+
+    def test_an_unknown_interface_becomes_a_lan_plane(self):
+        payload = {"ipv4_addresses": [{"interface": "en5", "address": "10.0.0.4"}]}
+        planes = device_mod.planes_from(payload)
+        self.assertEqual([p.name for p in planes], ["lan"])
+
+    def test_a_device_json_with_no_addresses_falls_back(self):
+        planes = device_mod.planes_from({}, "10.0.0.9")
+        self.assertEqual([(p.name, p.address) for p in planes], [("lan", "10.0.0.9")])
+
+    def test_usb_is_preferred_when_the_cable_is_in_this_host(self):
+        dev = device_mod.Device("id", "name", planes=[
+            {"name": "lan", "address": "127.0.0.1"},
+            {"name": "usb", "address": "127.0.0.1"}])
+        # Loopback is reachable by definition, which stands in for a live cable.
+        self.assertEqual(dev.active.name, "usb")
+        self.assertEqual([p.name for p in dev.ordered_planes()], ["usb", "lan"])
+
+    def test_an_unplugged_usb_plane_goes_last(self):
+        """The device advertises its USB address whether or not the cable is in
+        this machine, and connecting to one that is not costs a six second hang
+        rather than a refusal. So it must not be tried first."""
+        dev = device_mod.Device("id", "name", planes=[
+            {"name": "usb", "address": "172.17.99.177"},
+            {"name": "lan", "address": "127.0.0.1"}])
+        self.assertEqual([p.name for p in dev.ordered_planes()], ["lan", "usb"])
+        self.assertEqual(dev.active.name, "usb", "the record still keeps it")
+
+    def test_peer_address_of_a_point_to_point_link(self):
+        self.assertEqual(device_mod.peer_address("172.17.7.178", 30), "172.17.7.177")
+        self.assertEqual(device_mod.peer_address("172.17.7.177", 30), "172.17.7.178")
+        self.assertEqual(device_mod.peer_address("172.17.4.1", 31), "172.17.4.0")
+
+    def test_the_host_s_own_links_can_be_enumerated(self):
+        # Whatever this machine has, the shape has to be right: a /30 or /31 in
+        # the USB range, with a peer that is not us.
+        for interface, ours, peer in device_mod.host_links():
+            self.assertTrue(ours.startswith("172.17."))
+            self.assertNotEqual(ours, peer)
+            self.assertTrue(interface)
+
+
+class TestTwoPlanesLive(FakeFleetCase):
+    """The same fake box answering on both planes at once."""
+
+    def setUp(self):
+        super().setUp()
+        self.both = fake_mod.FakeDevice(index=5, planes=["usb", "lan"]).start()
+        self.addCleanup(self.both.stop)
+        self.dev = self.fleet.register(
+            self.both.host, key=self.both.key, name=self.both.name,
+            device_id=self.both.serial, planes=self.both.plane_records())
+
+    def test_it_registers_once_with_both_addresses(self):
+        self.assertEqual(len(self.dev.planes), 2)
+        self.assertEqual(sorted(self.dev.addresses), ["lan", "usb"])
+        self.assertEqual(self.dev.active.name, "usb")
+
+    def test_traffic_takes_the_usb_plane(self):
+        self.dev.running()
+        self.assertEqual(self.dev.plane, "usb")
+
+    def test_it_falls_back_to_lan_when_usb_goes_away(self):
+        self.dev.running()
+        self.assertEqual(self.dev.plane, "usb")
+        self.both.stop_plane("usb")
+        payload = self.dev.running()
+        self.assertIn("running", payload)
+        self.assertEqual(self.dev.plane, "lan")
+
+    def test_the_route_is_written_to_the_registry(self):
+        self.dev.running()
+        entries = Registry(self.fleet.registry.path).entries
+        saved = [e for e in entries if e["id"] == self.both.serial][0]
+        self.assertEqual(saved["plane"], "usb")
+        self.assertEqual(len(saved["planes"]), 2)
+
+    def test_one_lock_covers_both_planes(self):
+        """Two addresses for one NPU must not mean two lock files."""
+        lock = self.fleet.locks[self.both.serial]
+        other = DeviceLock(self.fleet._lock_host(self.dev))
+        self.assertEqual(lock.path, other.path)
+        self.assertIn(self.both.serial.lower(), os.path.basename(lock.path))
+
+    def test_a_onelane_neighbour_is_still_held_off(self):
+        """The serial-keyed lock alone would leave a neighbour free to collide.
+
+        OneLane keys on the address, so Pocket takes that file too. Without it a
+        OneLane process would take a lock nobody else holds and run straight
+        into a 150004.
+        """
+        lock = self.fleet.locks[self.both.serial]
+        neighbours = lock.neighbour_paths()
+        self.assertTrue(neighbours, "the device's addresses must be locked too")
+        expected = lock_path(self.dev.active.address)
+        self.assertIn(expected, neighbours)
+
+        held = lock.acquire(why="test")
+        try:
+            # A neighbour taking OneLane's file for this address must block.
+            import fcntl
+            fd = os.open(expected, os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                with self.assertRaises(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        finally:
+            lock.release(held)
+
+    def test_telemetry_reports_both_addresses(self):
+        payload = self.fleet.telemetry(self.both.serial, force=True)
+        self.assertTrue(payload["online"])
+        self.assertEqual(sorted(payload["transport"]["planes"]), ["lan", "usb"])
+        self.assertEqual(payload["transport"]["plane"], "usb")
+
+
+class TestFourDevices(FakeFleetCase):
+    """A person can own four boxes, and several can be on USB at once."""
+
+    devices = 4
+
+    def test_all_four_register_and_answer(self):
+        self.assertEqual(len(self.fleet.devices), 4)
+        overview = self.fleet.overview(force=True)
+        self.assertEqual(len(overview), 4)
+        self.assertTrue(all(row["online"] for row in overview))
+
+    def test_each_device_has_its_own_lock(self):
+        paths = {lock.path for lock in self.fleet.locks.values()}
+        self.assertEqual(len(paths), 4, "four boxes, four locks")
+
+    def test_the_model_index_unions_all_four(self):
+        index = self.fleet.index(force=True)
+        for slot in index.values():
+            self.assertTrue(slot["devices"])
+        every = set()
+        for slot in index.values():
+            every.update(slot["devices"])
+        self.assertEqual(len(every), 4)
+
+    def test_routing_reaches_a_model_loaded_on_the_fourth_box(self):
+        only_here = "Qwen/Qwen3-Reranker-0.6B"
+        self.fakes[3].state.installed.append(only_here)
+        self.fakes[3].state.loaded.append(only_here)
+        self.fleet.invalidate()
+        dev, _ = self.fleet.route(only_here, force=True)
+        self.assertEqual(dev.id, self.fakes[3].serial)
+
+
+class TestUdpDiscovery(unittest.TestCase):
+    """The one-packet discovery the device advertises in its own device.json."""
+
+    def setUp(self):
+        self.fake = fake_mod.FakeDevice(index=8).start()
+        self.addCleanup(self.fake.stop)
+        self.responder = fake_mod.FakeDiscovery(self.fake.state).start()
+        self.addCleanup(self.responder.stop)
+
+    def test_the_token_gets_the_whole_device_json_back(self):
+        found = device_mod.udp_probe(("127.0.0.1",), timeout=2,
+                                     port=self.responder.port)
+        self.assertEqual(len(found), 1)
+        address, payload = found[0]
+        self.assertEqual(payload["serial_number"], self.fake.serial)
+        self.assertEqual(payload["discovery_token"], "GADGET_DISCOVER_V1")
+
+    def test_a_wrong_token_gets_nothing(self):
+        import socket as _socket
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.settimeout(1)
+        try:
+            sock.sendto(b"hello?", ("127.0.0.1", self.responder.port))
+            with self.assertRaises(_socket.timeout):
+                sock.recvfrom(2048)
+        finally:
+            sock.close()
 
 
 class TestRegistration(FakeFleetCase):

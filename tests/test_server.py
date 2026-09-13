@@ -133,10 +133,16 @@ class TestDeviceApi(ServerCase):
         self.assertEqual(status, 404)
         self.assertIn("device.json", payload["error"]["message"])
 
-    def test_discover_needs_an_address_or_a_subnet(self):
+    def test_discover_needs_to_be_told_what_to_do(self):
+        """An empty body is a mistake, not a licence to broadcast.
+
+        The sweep sends a UDP broadcast across the network the machine is on, so
+        it happens when it is asked for and not by accident.
+        """
         status, payload = self.request("/api/discover", "POST", {})
         self.assertEqual(status, 400)
         self.assertIn("address or a subnet", payload["error"]["message"])
+        self.assertIn("auto", payload["error"]["message"])
 
     def test_a_bad_subnet_is_rejected_before_scanning(self):
         status, payload = self.request("/api/discover", "POST",

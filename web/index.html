@@ -72,13 +72,19 @@
             <label>Address<input id="add-address" placeholder="192.168.100.70"></label>
             <label>API key <span class="muted">optional</span>
               <input id="add-key" type="password" placeholder="found automatically if blank"></label>
-            <button class="btn" id="do-discover">Check</button>
+            <button class="btn" id="do-discover">Find devices</button>
             <button class="btn primary" id="do-add">Add</button>
           </div>
           <p class="muted">
+            Leave the address blank and press Find devices: Pocket broadcasts on
+            udp/39217 and checks any USB link this machine is plugged into. A box
+            answers on Wi-Fi and USB at once and reports both, so it registers
+            once with both addresses and prefers the USB link, which does not move.
+          </p>
+          <p class="muted">
             The key is read from <code>~/.tiinyapps/device.json</code> or the
-            TiinyOS app's local storage when you leave it blank. Nothing is
-            written into this repository.
+            TiinyOS app's local storage when you leave it blank, and each
+            candidate is tried against the device before it is kept.
           </p>
           <div class="form-row">
             <label>Scan a subnet <span class="muted">opt-in</span>

@@ -3,8 +3,9 @@
 
     python3 ainode-pocket --serve                 start the web app on 0.0.0.0:8430
     python3 ainode-pocket --serve --fake 2        same, against two fake devices
-    python3 ainode-pocket --device 192.168.100.70 register a device and exit
-    python3 ainode-pocket --scan 192.168.100      look for devices on a subnet
+    python3 ainode-pocket --discover              find every Tiiny this host sees
+    python3 ainode-pocket --discover --add        find them and register them all
+    python3 ainode-pocket --device 192.168.100.70 register one by address and exit
     python3 ainode-pocket --bench --device <id> --label first-run
     python3 ainode-pocket --selfcheck             offline check, no hardware
 
@@ -54,14 +55,16 @@ def build_fleet(count, registry_path=None, token_delay=0.0):
     The fake registry never touches the real one, so --fake cannot bury a user's
     actual devices under demo entries.
     """
-    fakes = fake_mod.fleet_of(count, token_delay=token_delay)
+    # The first fake answers on two planes, so a demo shows what a box plugged
+    # in over USB and joined to Wi-Fi actually looks like.
+    fakes = fake_mod.fleet_of(count, token_delay=token_delay,
+                              planes_for_first=["usb", "lan"] if count > 1 else None)
     path = registry_path or os.path.join(tempfile.mkdtemp(prefix="ainode-pocket-fake-"),
                                          "devices.json")
     fleet = Fleet(Registry(path))
     for fake in fakes:
         fleet.register(fake.host, key=fake.key, name=fake.name,
-                       gateway=fake.base, mgmt=fake.base, discovery=fake.base,
-                       device_id=fake.serial)
+                       device_id=fake.serial, planes=fake.plane_records())
     return fleet, fakes
 
 
@@ -112,49 +115,88 @@ def cmd_serve(args):
     return 0
 
 
+def register_one(fleet, address, key=None, name=None, planes=None, quiet=False):
+    """Register one device and report how it was reached."""
+    resolved = key or device_mod.find_key(verify=device_mod.key_checker(address))
+    if not resolved:
+        print("no working API key found for %s. Set TIINY_KEY, run `farm device`, "
+              "or pass --key." % address)
+        return None
+    dev = fleet.register(address, key=resolved, name=name, planes=planes)
+    telemetry = fleet.telemetry(dev.id, force=True)
+    if telemetry.get("error"):
+        print("registered %s, but it did not answer: %s" % (dev.id, telemetry["error"]))
+        return dev
+    if not quiet:
+        units = telemetry.get("npu_units") or {}
+        print("registered %s (%s)" % (dev.name, dev.id))
+        print("  reached via %s" % dev.route_label)
+        print("  NPU %s/%s units   loaded: %s"
+              % (units.get("used"), units.get("total"),
+                 ", ".join(telemetry.get("running") or []) or "nothing"))
+    return dev
+
+
 def cmd_device(args):
     fleet = Fleet()
     address = args.device
     payload = device_mod.probe(address)
+    planes = None
     if payload:
+        planes = [p.as_dict() for p in device_mod.planes_from(payload, address)]
         print("found %s at %s" % (payload.get("device_name") or "a Tiiny", address))
+        if len(planes) > 1:
+            print("  it answers on %s"
+                  % ", ".join("%s %s" % (p["name"], p["address"]) for p in planes))
     else:
         print("no discovery responder at http://%s:%d/device.json; registering anyway"
               % (address, device_mod.DISCOVERY_PORT))
-    key = args.key or device_mod.find_key()
-    if not key:
-        print("no API key found. Set TIINY_KEY, run `farm device`, or pass --key.")
+    dev = register_one(fleet, address, args.key, args.name, planes)
+    if dev is None:
         return 2
-    dev = fleet.register(address, key=key, name=args.name)
-    telemetry = fleet.telemetry(dev.id, force=True)
-    if telemetry.get("error"):
-        print("registered %s, but it did not answer: %s" % (dev.id, telemetry["error"]))
-        return 1
-    units = telemetry.get("npu_units") or {}
-    print("registered %s (%s)" % (dev.name, dev.id))
-    print("  NPU %s/%s units   loaded: %s"
-          % (units.get("used"), units.get("total"),
-             ", ".join(telemetry.get("running") or []) or "nothing"))
     print("  registry: %s" % fleet.registry.path)
     return 0
 
 
 def cmd_discover(args):
-    if args.scan:
-        print("scanning %s.0/24 for discovery responders on port %d ..."
-              % (args.scan.split("/")[0].rsplit(".", 1)[0] if args.scan.count(".") == 3
-                 else args.scan, device_mod.DISCOVERY_PORT))
-        hits = device_mod.scan(args.scan)
-    else:
+    """Find every Tiiny this host can see.
+
+    A UDP broadcast plus the point-to-point links this host is plugged into,
+    with an optional /24 scan for a network that drops broadcast.
+    """
+    subnet = args.scan if args.scan else None
+    if args.discover and args.discover is not True:
         payload = device_mod.probe(args.discover)
-        hits = [(args.discover, payload)] if payload else []
-    if not hits:
+        if not payload:
+            print("nothing answered http://%s:%d/device.json"
+                  % (args.discover, device_mod.DISCOVERY_PORT))
+            return 1
+        records = [{"serial": device_mod.identity(payload, args.discover),
+                    "name": payload.get("device_name") or "?",
+                    "planes": device_mod.planes_from(payload, args.discover),
+                    "seen_at": [args.discover]}]
+    else:
+        if subnet:
+            print("broadcasting, checking USB links, and scanning %s.0/24 ..." % subnet)
+        else:
+            print("broadcasting on udp/%d and checking USB links ..."
+                  % device_mod.UDP_DISCOVERY_PORT)
+        records = device_mod.discover(subnet=subnet)
+    if not records:
         print("nothing found")
         return 1
-    for address, payload in hits:
-        print("%-16s %-22s %s" % (address, payload.get("device_name") or "?",
-                                  payload.get("sn") or ""))
-    print("\nregister one with: python3 ainode-pocket --device <address>")
+    print()
+    for record in records:
+        where = "  ".join("%s %s" % (p.name, p.address) for p in record["planes"])
+        print("%-22s %-18s %s" % (record["serial"], record["name"], where))
+    if args.add:
+        fleet = Fleet()
+        print()
+        for record in records:
+            planes = [p.as_dict() for p in record["planes"]]
+            register_one(fleet, planes[0]["address"], args.key, record["name"], planes)
+        return 0
+    print("\nregister them with: python3 ainode-pocket --discover --add")
     return 0
 
 
@@ -292,10 +334,13 @@ def main(argv=None):
                         help="register a device by address and exit")
     parser.add_argument("--key", help="API key for --device (otherwise discovered)")
     parser.add_argument("--name", help="friendly name for --device")
-    parser.add_argument("--discover", metavar="ADDRESS",
-                        help="read /device.json from one address")
+    parser.add_argument("--discover", nargs="?", const=True, metavar="ADDRESS",
+                        help="find devices: UDP broadcast plus this host's USB "
+                             "links, or read /device.json from one address")
     parser.add_argument("--scan", metavar="SUBNET",
-                        help="probe a /24 for devices, for example 192.168.100")
+                        help="also probe a /24, for example 192.168.100")
+    parser.add_argument("--add", action="store_true",
+                        help="register everything --discover finds")
     parser.add_argument("--bench", action="store_true", help="run the benchmark")
     parser.add_argument("--label", help="label for a benchmark run")
     parser.add_argument("--only", help="benchmark subset: prefill,sustained,"

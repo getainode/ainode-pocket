@@ -14,9 +14,12 @@ One command, one page on port 8430, one base URL for your clients. Python 3.9 or
 
 ## What it does
 
-**Registers devices.** Paste an address, or let it read `/device.json` from the
-unauthenticated discovery service on port 39218. A subnet scan is available and
-is opt-in, never automatic.
+**Finds and registers devices.** Press Find devices and Pocket broadcasts the
+token the device advertises on udp/39217, then checks any USB link this machine
+is plugged into. A box answers on Wi-Fi and USB at the same time and reports
+both addresses itself, so it registers once with both and prefers the USB link,
+which is a fixed point-to-point /30 rather than a DHCP lease that will move. A
+subnet scan is there too, opt-in, for a network that drops broadcast.
 
 **Shows what each device is doing.** NPU units used of the 100 available, NPU
 memory, storage, CPU, every loaded model with its instance port and unit cost,
@@ -27,7 +30,8 @@ with load, unload, delete, and download with live progress over the device's own
 server-sent-events endpoint.
 
 **Serves one endpoint.** `/v1/models` is the union across your devices.
-`/v1/chat/completions` routes by model id, streaming or not.
+`/v1/chat/completions` routes by model id, streaming or not, over whichever
+address and transport that device actually answers on.
 
 **Chats and benchmarks.** A chat page that talks to that same endpoint, and the
 tiiny-bench suite embedded as a page and a CLI subcommand.
@@ -115,6 +119,66 @@ streaming is the only way partial output survives that ceiling.
 
 ---
 
+## How a device is actually reached
+
+Two things about addressing a Tiiny are not obvious, and both were found against
+real hardware rather than in a document.
+
+### The gateway is not always on port 8800
+
+On the firmware this was tested against, **port 8800 is closed to the LAN**. The
+same service still answers on port 80 by virtual host, which is how the vendor
+CLI addresses it:
+
+```bash
+curl http://192.168.100.94/api/v1/models/npu/status -H 'Host: p8800.api.tiiny'
+curl http://192.168.100.94/v1/models                -H 'Host: openai.api.tiiny'
+```
+
+Two virtual hosts, split by path: `p8800.api.tiiny` for the model and NPU
+endpoints, `openai.api.tiiny` for the OpenAI-compatible surface. Without a Host
+header port 80 serves the device management plane.
+
+Pocket tries the direct port first and falls back to the virtual host **only
+when the direct port refuses the connection**, then remembers which one worked
+and writes it to the registry, so a settled device makes exactly one attempt per
+call. A 401 or a 5xx means the port is open and answering, so neither sends it
+hunting for another route. The device card says which one is in use.
+
+### A device has more than one address
+
+Every Tiiny answers on two planes at once and reports both in its own
+`device.json`:
+
+```json
+"ipv4_addresses": [
+  {"interface": "usb0",  "address": "172.17.7.177"},
+  {"interface": "wlan0", "address": "192.168.100.94"}
+]
+```
+
+USB is a point-to-point `/30` that never changes; the Wi-Fi address is DHCP and
+will move. So Pocket keeps both, prefers USB, and falls back to the LAN address
+when the cable is out. Several boxes can be plugged in at once, each on its own
+interface and its own `/30`, and Pocket enumerates the host's links to find them.
+
+One wrinkle worth knowing, because it cost a measurement to find: a device
+advertises its USB address whether or not the cable is in **your** machine, and
+connecting to a `/30` you are not part of does not get refused, it hangs for six
+seconds. So the USB plane is only tried first when this host is actually on that
+link.
+
+### Discovery
+
+`device.json` advertises `udp_discovery_port: 39217` and
+`discovery_token: "GADGET_DISCOVER_V1"`. Sending that token to that port, unicast
+or broadcast, returns the whole of `device.json` in one datagram. That is the
+cheapest discovery there is, it finds a box whose DHCP address has moved, and it
+is what Find devices does before falling back to anything slower.
+
+Answers are folded together by `serial_number`, so a box that replies on both
+planes registers once, with both addresses.
+
 ## The lock, and why it is the point
 
 A Tiiny runs one inference at a time. It does not batch. A second request
@@ -137,6 +201,18 @@ than importing it, because it ships with the standard library alone, and it
 keeps OneLane's file naming and holder record on purpose. A Pocket process and a
 OneLane process pointed at the same device take out the same lock file and
 genuinely take turns.
+
+One device needs more than one of those files, and this is the part that fails
+silently if you get it wrong. A Tiiny answers on USB and Wi-Fi at once, so a lock
+keyed on the address gives **no exclusion at all** between a process using one
+address and a process using the other. Pocket therefore takes two kinds:
+
+- one keyed on the **serial number**, which covers every plane, and
+- OneLane's **address-keyed** lock for each address the device has, so a
+  neighbour that only knows about addresses is still held off.
+
+They are taken in a fixed order, so two Pocket processes cannot deadlock against
+each other.
 
 Two limits, both OneLane's as well, and worth knowing:
 
@@ -231,9 +307,12 @@ signature of a strict serial queue rather than a batching scheduler.
 ```
 python3 ainode-pocket --serve                      web app and endpoint on 0.0.0.0:8430
 python3 ainode-pocket --serve --fake 2             two fake devices, no hardware
-python3 ainode-pocket --device 192.168.100.70      register a device and exit
+python3 ainode-pocket --discover                   find every Tiiny this host can see
+python3 ainode-pocket --discover --add             find them and register them all
+python3 ainode-pocket --device 192.168.100.70      register one by address and exit
 python3 ainode-pocket --discover 192.168.100.70    read /device.json from one address
-python3 ainode-pocket --scan 192.168.100           probe a /24 for devices
+python3 ainode-pocket --scan 192.168.100           also probe a /24, for a network
+                                                   that drops broadcast
 python3 ainode-pocket --bench --device <id> --label first-run
 python3 ainode-pocket --results                    list saved benchmark results
 python3 ainode-pocket --selfcheck                  offline check, no hardware
@@ -248,7 +327,7 @@ python3 ainode-pocket --selfcheck                  offline check, no hardware
 python3 -m unittest discover -s tests
 ```
 
-107 tests, no hardware and no network beyond loopback. They run against a fake
+140 tests, no hardware and no network beyond loopback. They run against a fake
 device that reproduces the recorded response shapes, and each assertion in
 `tests/test_fake.py` names the artefact its shape came from. The fake also
 reproduces both failures that matter, so the code has actually met them: the
@@ -262,61 +341,77 @@ measuring the lock rather than a device that never had the problem.
 
 ---
 
-## Hardware validation checklist
+## Hardware validation
 
-**Every device call in this build was made against the fake device in
-`pocket/fake.py`. None of it has touched real hardware.** The Tiiny at
-192.168.100.70 was unreachable throughout, so the fake was built from the
-recorded artefacts instead: `spec-8800.json` (the gateway's own OpenAPI
-document) for the schema shapes, `RUNBOOK.md` for the live-verified bodies the
-spec declares only as free-form objects, and `CAPABILITIES.md` for the measured
-behaviour and the NPU unit costs. Where a shape could not be sourced from a
-recording it is marked unverified in the code rather than guessed.
+First contact with a real device was **2026-09-13**, against a Tiiny AI Pocket
+Lab (serial `TNYM26072400300011Q`, TiinyOS 0.1.34) on the LAN. Everything below
+was exercised **read-only**: nothing was downloaded, loaded, unloaded or deleted,
+and no device setting was changed.
 
-### Five shapes that are not verified
+### What the device confirmed
 
-The specs declare these responses as free-form objects and no live body was
-captured, so they are inferred from adjacent evidence, marked `UNVERIFIED` at
-each site in `pocket/fake.py`, and read defensively by the code that consumes
-them.
+| Check | Result |
+|---|---|
+| Discovery by UDP broadcast | found it in one packet, with both planes |
+| `device.json` field names | `serial_number`, `discovery_token`, `usb.network`, `ipv4_addresses` all as expected |
+| Key discovery from TiinyOS local storage | one candidate, verified live before use |
+| Port 8800 direct | **refused**, in 0.05 s |
+| Port 80 with `Host: p8800.api.tiiny` | 200 |
+| Port 80 with `Host: openai.api.tiiny` on `/v1/models` | 200 |
+| `/api/v1/sys/status` on port 80, no header | 200 |
+| Transport fallback | resolved to the virtual host and was written to the registry |
+| Both planes recorded, LAN chosen | the USB cable was not in this machine, and Pocket detected that rather than hanging on it |
+| NPU units, memory, storage, CPU, running models | all present and matching the device |
+| `/v1/models` through Pocket | 20 models, 1 ready |
+| 503 for an installed but unloaded model | named the device holding it |
+| 503 for a model the fleet has never heard of | listed what the fleet does have |
+| Routing to the loaded model | reached the device; its own error came back attributed to it |
+| Lock files | one per device, named by serial, with the address lock alongside |
 
-| Shape | What it is based on | What breaks if it is wrong |
+### What it corrected
+
+- **`/api/v1/models/storage` was wrong.** The real response wraps everything in a
+  `{"success": true, "data": {...}}` envelope; the version inferred from prose
+  did not. Nothing in Pocket reads that endpoint, which is exactly why the
+  mistake could sit there unnoticed.
+- **`device_info` carries no serial.** The serial comes from `device.json`, and
+  that is what the device is registered under.
+- **NPU utilisation is not always stuck at zero.** It read 12.48% on 0.1.34,
+  where the earlier bug report had it pinned at 0.0 on 0.1.33. The card now only
+  carries the caveat when the number is actually zero.
+- **The NPU memory pool reported 14543 MB**, not the 49024 MB recorded against
+  0.1.33. Worth re-checking before anyone quotes a pool size.
+
+### Three shapes that are still not verified
+
+| Shape | Based on | What breaks if it is wrong |
 |---|---|---|
-| `POST /api/v1/models/{id}/download/stream`, the SSE frame body | the `get_progress` fields plus `speed_human`, a real `OpenAIModel` field | the download bar shows status text instead of a percentage; the download itself is unaffected |
-| `GET /api/v1/models/{id}/get_progress` | tiiny-hud reads `progress` and `status` off a live device and works, so this is second hand rather than guessed | the progress readout only |
-| `GET /device.json` on 39218 | `RUNBOOK.md` records what it returns in prose but not the field names | nothing: the serial lookup tries several spellings and falls back to the address |
-| `GET /api/v1/models/storage` | `RUNBOOK.md`'s description of a failed download's storage record | nothing in Pocket: disk usage is read from `/api/v1/sys/status` |
-| `devices[].temp_c` and `power_w` in `/api/v1/npu/status` | declared by the spec, never observed filled in | nothing: the card says the firmware reports no temperature, and shows real readings if any ever arrive |
+| `POST /api/v1/models/{id}/download/stream`, the SSE frame body | the `get_progress` fields plus `speed_human`, a real `OpenAIModel` field | the download bar shows status text instead of a percentage; the download itself is unaffected. Confirming it means starting a download, which is a write |
+| `GET /api/v1/models/{id}/get_progress` while a download is running | confirmed for a model already on disk (`model_id`, `fullname`, `status`, `progress`); the downloading case is inferred | the progress readout only |
+| `devices[].temp_c` and `power_w` in `/api/v1/npu/status` | declared by the spec, confirmed present and null on live firmware | nothing: the card says the firmware reports no temperature |
 
-Work through this against a real device before trusting any of it:
+### Still to do on hardware
+
+These need a write, a second box, or a cable, so they were left alone:
 
 | # | Check | Expected |
 |---|---|---|
-| 1 | `python3 ainode-pocket --discover <address>` | device name and serial from `/device.json`, no key needed |
-| 2 | `python3 ainode-pocket --scan <subnet>` | finds the device, touches nothing else |
-| 3 | `python3 ainode-pocket --device <address>` | registers, and prints NPU units and loaded models |
-| 4 | Overview page | units, NPU memory, storage and CPU match `/api/v1/sys/status` and the TiinyOS app |
-| 5 | Overview, thermals row | either real readings, or the honest "this firmware reports no temperature" |
-| 6 | Models page | installed list and unit costs match the TiinyOS Models screen |
-| 7 | Load a small model (the 0.6B embedding model, 1 unit) | appears in the running list within seconds |
-| 8 | Load something that does not fit the remaining budget | refused with the device's own message, not a silent failure |
-| 9 | Unload it | disappears; the response carries `removed_container_ids` |
-| 10 | Download from the catalog | progress advances and the SSE stream ends at 100 |
-| 11 | Delete a loaded model | refused with 409, as the spec declares |
-| 12 | `curl /v1/models` | the union matches what each device reports |
-| 13 | Chat page, one question | answers, and names the device that served it |
-| 14 | Ask for a model that is installed but not loaded | 503 naming the device that holds it |
-| 15 | Eight concurrent callers (`--bench`, concurrency test) | all served, zero 150004, aggregate flat at about 24 tok/s |
-| 16 | Run OneLane against the same device while Pocket is busy | it waits rather than colliding; check `/tmp/turnstile/` for one lock file, not two |
-| 17 | Ask for a very long answer, non-streaming | 504 at about 220 s with the ceiling explained |
-| 18 | The same request with `stream: true` | tokens keep arriving past that point |
-| 19 | Two devices registered | `/v1/models` unions them and routing reaches both |
-| 20 | Pull the network on one device | that card goes offline with a reason; the other keeps serving |
+| 1 | Load a small model (the 0.6B embedding model, 1 unit) | appears in the running list within seconds |
+| 2 | Load something that does not fit the remaining budget | refused with the device's own message |
+| 3 | Unload it | disappears; the response carries `removed_container_ids` |
+| 4 | Download from the catalog | progress advances and the SSE stream ends at 100 |
+| 5 | Delete a loaded model | refused with 409, as the spec declares |
+| 6 | Chat against a model that supports chat | answers, and names the device that served it |
+| 7 | Eight concurrent callers (`--bench`, concurrency test) | all served, zero 150004, aggregate flat at about 24 tok/s |
+| 8 | Run OneLane against the same device while Pocket is busy | it waits rather than colliding |
+| 9 | Ask for a very long answer, non-streaming | 504 at about 220 s with the ceiling explained |
+| 10 | The same request with `stream: true` | tokens keep arriving past that point |
+| 11 | Plug the box in over USB | the card switches to the USB plane on its own |
+| 12 | Two or more boxes | `/v1/models` unions them and routing reaches each |
+| 13 | Pull the network on one box | that card goes offline with a reason; the others keep serving |
 
-Rows 15 to 18 are the ones most likely to differ from the fake, because they are
-the ones that depend on real NPU timing.
-
----
+Rows 7, 9 and 10 are the ones most likely to differ from the fake, because they
+are the ones that depend on real NPU timing.
 
 ## Layout
 
@@ -329,7 +424,7 @@ pocket/server.py       the HTTP server, the JSON API, static assets
 pocket/bench.py        tiiny-bench, embedded
 pocket/fake.py         a fake device built from the recorded artefacts
 web/                   the page: one html, one css, one js
-tests/                 107 tests, no hardware
+tests/                 140 tests, no hardware
 manifests/             the tiinyapp.farm manifest
 ```
 

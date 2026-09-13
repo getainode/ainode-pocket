@@ -311,15 +311,18 @@ class Handler(BaseHTTPRequestHandler):
         key = (payload.get("key") or "").strip()
         if not key:
             # Never ask the user to paste a key we can find ourselves, and never
-            # keep one anywhere but their own data directory.
-            settings = device_mod.tiinyapps_settings()
-            key = os.environ.get("TIINY_KEY", "").strip() or (settings or {}).get("key", "")
+            # keep one anywhere but their own data directory. Candidates are
+            # tried against the device, the way tiiny-bench does, because the
+            # local storage holds several UUIDs and only one is live.
+            key = device_mod.find_key(
+                verify=device_mod.key_checker(address, gateway_url or None))
         try:
             dev = self.fleet.register(address, key=key or None,
                                      name=payload.get("name"),
                                      gateway=gateway_url or None,
                                      mgmt=payload.get("mgmt") or None,
-                                     discovery=payload.get("discovery") or None)
+                                     discovery=payload.get("discovery") or None,
+                                     planes=payload.get("planes") or None)
         except Exception as exc:
             return self.send_json(400, {"error": {"message": str(exc)}})
         probe = {"online": False, "error": None}
@@ -328,28 +331,50 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             probe = {"online": False, "error": str(exc)}
         return self.send_json(200, {"device": {"id": dev.id, "name": dev.name,
-                                              "address": dev.address},
+                                              "address": dev.address,
+                                              "addresses": dev.addresses,
+                                              "route": dev.route_label},
                                     "telemetry": probe})
 
     def discover(self, payload):
+        """Find devices.
+
+        With no address this is the automatic sweep: a UDP broadcast plus the
+        point-to-point links this host is plugged into. One box answering on
+        both planes comes back once, with both addresses.
+        """
         address = (payload.get("address") or "").strip()
         subnet = (payload.get("subnet") or "").strip()
+        auto = bool(payload.get("auto"))
+        if not (address or subnet or auto):
+            return self.send_json(400, {"error": {
+                "message": "give an address or a subnet, or auto for a broadcast "
+                           "sweep of this network and any USB link"}})
         if address:
             found = device_mod.probe(address)
             if not found:
                 return self.send_json(404, {"error": {
                     "message": "nothing answered http://%s:%d/device.json"
                                % (address, device_mod.DISCOVERY_PORT)}})
-            return self.send_json(200, {"found": [{"address": address,
-                                                   "device": found}]})
-        if subnet:
+            records = [{"serial": device_mod.identity(found, address),
+                        "name": found.get("device_name") or address,
+                        "device": found, "seen_at": [address],
+                        "planes": device_mod.planes_from(found, address)}]
+        else:
             try:
-                hits = device_mod.scan(subnet)
+                records = device_mod.discover(subnet=subnet or None)
             except ValueError as exc:
                 return self.send_json(400, {"error": {"message": str(exc)}})
-            return self.send_json(200, {"found": [{"address": addr, "device": doc}
-                                                  for addr, doc in hits]})
-        return self.send_json(400, {"error": {"message": "give an address or a subnet"}})
+        out = []
+        for record in records:
+            planes = [p.as_dict() for p in record["planes"]]
+            out.append({"serial": record["serial"], "name": record["name"],
+                        "addresses": {p["name"]: p["address"] for p in planes},
+                        "planes": planes, "seen_at": record.get("seen_at", []),
+                        "address": planes[0]["address"] if planes else None,
+                        "known": record["serial"] in self.fleet.devices,
+                        "device": record["device"]})
+        return self.send_json(200, {"found": out})
 
     def model_action(self, action, payload):
         device_id = payload.get("device")

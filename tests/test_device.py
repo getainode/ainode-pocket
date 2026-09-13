@@ -43,7 +43,7 @@ class TestEncoding(unittest.TestCase):
 class TestClient(FakeFleetCase):
     def test_telemetry_calls(self):
         dev = self.device
-        self.assertEqual(dev.device_json()["sn"], self.fake.serial)
+        self.assertEqual(dev.device_json()["serial_number"], self.fake.serial)
         self.assertEqual(dev.device_info()["tiiny_os"], "0.1.33")
         self.assertIn("npus", dev.sys_status())
 
@@ -136,6 +136,126 @@ class TestClient(FakeFleetCase):
         host, port = device_mod.base_url_parts(self.fake.base)
         self.assertEqual(host, "127.0.0.1")
         self.assertEqual(port, self.fake.port)
+
+
+class TestTransport(FakeFleetCase):
+    """Reaching the gateway when port 8800 is closed to the LAN.
+
+    On this firmware the direct port refuses the connection and the same service
+    answers on port 80 by virtual host, which is how the vendor CLI addresses it.
+    The fake reproduces both halves: a closed direct port, and a port 80 that
+    serves the management plane unless the right Host header is present.
+    """
+
+    fake_kwargs = {"vhost_only": True}
+
+    def test_the_direct_port_really_is_refused(self):
+        """A control, so the rest of this class is not passing for free."""
+        direct = device_mod.Device("x", "x", "127.0.0.1", key=self.fake.key,
+                                   gateway=self.fake.gateway_base,
+                                   mgmt=self.fake.gateway_base,
+                                   discovery=self.fake.gateway_base,
+                                   vhost_base=self.fake.gateway_base, timeout=3)
+        with self.assertRaises(device_mod.DeviceUnreachable):
+            direct.running()
+
+    def test_a_gateway_call_falls_back_to_the_virtual_host(self):
+        dev = self.device
+        self.assertIsNone(dev.transport, "transport starts undetermined")
+        running = dev.running()
+        self.assertIn("running", running)
+        self.assertEqual(dev.transport, device_mod.TRANSPORT_VHOST)
+        self.assertTrue(self.fake.state.vhost_hits)
+
+    def test_the_two_surfaces_use_the_host_headers_the_cli_sends(self):
+        self.assertEqual(device_mod.Device.vhost_for("/api/v1/models/running"),
+                         "p8800.api.tiiny")
+        self.assertEqual(device_mod.Device.vhost_for("/api/v1/npu/status"),
+                         "p8800.api.tiiny")
+        self.assertEqual(device_mod.Device.vhost_for("/v1/models"),
+                         "openai.api.tiiny")
+        self.assertEqual(device_mod.Device.vhost_for("/v1/chat/completions"),
+                         "openai.api.tiiny")
+
+    def test_both_surfaces_answer_over_the_fallback(self):
+        dev = self.device
+        # /api/v1 behind p8800, /v1 behind openai: one device, two Host headers.
+        self.assertEqual(dev.npu_units()["npu_total"], 100)
+        self.assertTrue(dev.models())
+        reply = dev.chat({"model": self.loaded_model(), "max_tokens": 8,
+                          "messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(reply["choices"][0]["message"]["content"])
+
+    def test_the_working_transport_is_remembered(self):
+        dev = self.device
+        dev.running()
+        self.assertEqual(dev.transport, device_mod.TRANSPORT_VHOST)
+        # Once known, the refused port is not tried again: only one route is
+        # offered for the next call.
+        routes = dev.attempts("gateway", "/api/v1/models/running")
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0][2], "p8800.api.tiiny")
+
+    def test_port_80_without_the_header_is_the_management_plane(self):
+        """Proof the fake is actually checking, rather than serving everything."""
+        import urllib.request
+        req = urllib.request.Request(self.fake.base + "/", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode())
+        self.assertEqual(payload["service"], "device management")
+
+    def test_the_management_surface_needs_no_header(self):
+        # /api/v1/sys/* and /device.json answer on port 80 unrouted, which is
+        # why Pocket never sends a Host header for them.
+        self.assertEqual(self.device.device_json()["serial_number"], self.fake.serial)
+        self.assertIn("npus", self.device.sys_status())
+
+    def test_telemetry_reports_which_transport_is_in_use(self):
+        payload = self.fleet.telemetry(self.fake.serial, force=True)
+        self.assertTrue(payload["online"])
+        self.assertEqual(payload["transport"]["gateway"], device_mod.TRANSPORT_VHOST)
+        self.assertIn("port 80", payload["transport"]["label"])
+
+    def test_streaming_works_over_the_fallback(self):
+        dev = self.device
+        dev.running()  # resolve the transport first
+        frames = [line for line in dev.chat_stream(
+            {"model": self.loaded_model(), "max_tokens": 8,
+             "messages": [{"role": "user", "content": "hi"}]})
+            if line.strip().startswith("data:")]
+        self.assertTrue(frames)
+
+
+class TestTransportIsNotOverEager(FakeFleetCase):
+    """An answering port must never send the client hunting for another route."""
+
+    def test_a_401_does_not_trigger_the_fallback(self):
+        dev = self.device
+        dev.key = "not-the-key"
+        with self.assertRaises(device_mod.DeviceError) as caught:
+            dev.running()
+        self.assertEqual(caught.exception.status, 401)
+        self.assertNotEqual(dev.transport, device_mod.TRANSPORT_VHOST)
+
+    def test_a_gateway_5xx_does_not_trigger_the_fallback(self):
+        dev = self.device
+        self.fake.state.token_delay = 0.01
+        self.fake.state.request_ceiling = 0.02
+        with self.assertRaises(device_mod.DeviceTimeout) as caught:
+            dev.chat({"model": self.loaded_model(), "max_tokens": 60,
+                      "messages": [{"role": "user", "content": "long"}]})
+        self.assertEqual(caught.exception.status, 504)
+        self.assertNotEqual(dev.transport, device_mod.TRANSPORT_VHOST)
+
+    def test_an_open_direct_port_resolves_to_direct(self):
+        dev = self.device
+        dev.running()
+        self.assertEqual(dev.transport, device_mod.TRANSPORT_DIRECT)
+
+    def test_a_device_with_no_separate_vhost_base_has_one_route(self):
+        dev = self.device
+        self.assertEqual(dev.vhost_base, dev.gateway)
+        self.assertEqual(len(dev.attempts("gateway", "/api/v1/models/running")), 1)
 
 
 class TestKeyDiscovery(unittest.TestCase):

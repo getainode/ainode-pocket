@@ -32,10 +32,20 @@ class FakeFleetCase(unittest.TestCase):
         self.fakes = fake_mod.fleet_of(self.devices, **self.fake_kwargs)
         self.fleet = Fleet(Registry(os.path.join(self.workdir, "devices.json")))
         for entry in self.fakes:
-            self.fleet.register(entry.host, key=entry.key, name=entry.name,
-                                gateway=entry.base, mgmt=entry.base,
-                                discovery=entry.base, device_id=entry.serial)
+            self.register(entry)
         self.addCleanup(self._teardown)
+
+    def register(self, entry, fleet=None):
+        """Register a fake, wired for whichever transport it offers.
+
+        gateway_base is the fake's own address for an ordinary fake, and a
+        closed port for a vhost-only one, so the client has to fall back exactly
+        as it does against firmware with port 8800 shut.
+        """
+        return (fleet or self.fleet).register(
+            entry.host, key=entry.key, name=entry.name,
+            gateway=entry.gateway_base, mgmt=entry.base, discovery=entry.base,
+            vhost_base=entry.base, device_id=entry.serial)
 
     def _teardown(self):
         for entry in self.fakes:

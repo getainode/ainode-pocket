@@ -14,6 +14,15 @@ and a OneLane process pointed at the same device take out the same lock file and
 therefore genuinely take turns. That interoperability is the reason not to
 invent a new path.
 
+One device needs more than one of those files, though, and this is the part that
+is easy to get silently wrong. A Tiiny answers on USB and Wi-Fi at the same time,
+so a lock keyed on the address gives no exclusion at all between a process using
+one address and a process using the other. Pocket therefore takes a lock keyed
+on the serial number, which covers every plane, and also takes OneLane's
+address-keyed lock for each address the device has, so a neighbour that only
+knows about addresses is still held off. They are acquired in a fixed order, so
+two Pocket processes cannot deadlock against each other.
+
 Two honest limits, both OneLane's as well:
   * The lock is advisory. A program that ignores it still collides.
   * flock coordinates processes on one host. Two machines pointed at one Tiiny
@@ -102,16 +111,35 @@ class DeviceLock:
     being shared is worse than one that admits it.
     """
 
-    def __init__(self, host, owner="ainode-pocket"):
+    def __init__(self, host, owner="ainode-pocket", neighbour_hosts=None):
         self.host = host
         self.owner = owner
         self.path = lock_path(host)
+        # A device answers on more than one address, so two locks are needed and
+        # they do different jobs. The one above is keyed on the serial and gives
+        # exclusion across planes, which an address-keyed lock cannot: the same
+        # box reached over USB by one process and over the LAN by another would
+        # otherwise take out two different files and serialise nothing. The ones
+        # below are the addresses OneLane keys on, taken so a OneLane neighbour
+        # on this host still takes turns with us.
+        self.neighbour_hosts = neighbour_hosts or (lambda: [])
         self.shared = fcntl is not None
         self.reason = None if fcntl is not None else "no fcntl on this platform"
         self._local = threading.Lock()
         self._waiting = 0
         self._guard = threading.Lock()
         self._held_since = None
+
+    def neighbour_paths(self):
+        """OneLane's lock files for the addresses this device is reachable at."""
+        seen = []
+        for host in self.neighbour_hosts():
+            if not host:
+                continue
+            path = lock_path(host)
+            if path != self.path and path not in seen:
+                seen.append(path)
+        return sorted(seen)
 
     @property
     def waiting(self):
@@ -127,13 +155,14 @@ class DeviceLock:
         started = self._held_since
         return None if started is None else round(time.time() - started, 2)
 
-    def _open_shared(self):
-        """Open the lock file so any user sharing the device can lock it.
+    def _open_shared(self, path=None):
+        """Open a lock file so any user sharing the device can lock it.
 
         O_NOFOLLOW because the path is predictable and the directory is
         world-writable, which is the classic symlink-attack shape.
         """
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, LOCK_MODE)
+        fd = os.open(path or self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                     LOCK_MODE)
         return fd
 
     def _write_record(self, fd, record):
@@ -159,30 +188,37 @@ class DeviceLock:
         finally:
             with self._guard:
                 self._waiting -= 1
-        fd = None
+        handles = []
         if fcntl is not None:
-            try:
-                fd = self._open_shared()
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                self._write_record(fd, {"owner": self.owner, "pid": os.getpid(),
-                                        "why": why, "since": time.time()})
-            except OSError as exc:
-                # Degrade to in-process only rather than refusing to serve, but
-                # record why so the UI can say the lock is not shared.
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+            # Always the serial lock first, then the address locks in sorted
+            # order. Every Pocket process takes them in the same order, so two
+            # of them cannot deadlock against each other, and a OneLane
+            # neighbour only ever wants one of the address locks.
+            record = {"owner": self.owner, "pid": os.getpid(),
+                      "why": why, "since": time.time()}
+            for path in [self.path] + self.neighbour_paths():
                 fd = None
-                self.shared = False
-                self.reason = str(exc)
+                try:
+                    fd = self._open_shared(path)
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    self._write_record(fd, record)
+                    handles.append(fd)
+                except OSError as exc:
+                    # Degrade rather than refuse to serve, but record why so the
+                    # UI can say the lock is not fully shared.
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    self.shared = False
+                    self.reason = str(exc)
         self._held_since = time.time()
-        return fd
+        return handles
 
-    def release(self, fd):
+    def release(self, handles):
         self._held_since = None
-        if fd is not None:
+        for fd in reversed(handles or []):
             try:
                 self._write_record(fd, {})
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -252,6 +288,11 @@ class Registry:
 
     def save(self):
         with self._guard:
+            # The default path's directory is made by data_dir(), but an
+            # explicit one may not exist yet.
+            folder = os.path.dirname(self.path)
+            if folder:
+                os.makedirs(folder, mode=0o700, exist_ok=True)
             tmp = self.path + ".tmp"
             blob = json.dumps({"devices": self.entries}, indent=2) + "\n"
             with open(tmp, "w", encoding="utf-8") as handle:
@@ -302,24 +343,79 @@ class Fleet:
             entry["id"], entry.get("name") or entry["id"], entry.get("address", ""),
             key=entry.get("key") or device_mod.find_key(),
             gateway=entry.get("gateway"), mgmt=entry.get("mgmt"),
-            discovery=entry.get("discovery"))
+            discovery=entry.get("discovery"), transport=entry.get("transport"),
+            vhost_base=entry.get("vhost_base"), planes=entry.get("planes"),
+            plane=entry.get("plane"))
+        # Remember the route once it is known, so a device on firmware with port
+        # 8800 closed does not re-probe a refused port on every restart, and a
+        # box reached over USB is not rediscovered every time.
+        dev.on_route_change = lambda plane, transport, key=dev.id: \
+            self._save_route(key, plane, transport)
         self.devices[dev.id] = dev
-        host = device_mod.base_url_parts(dev.gateway)[0] or dev.address or dev.id
-        self.locks[dev.id] = DeviceLock(host)
+        # One lock per device, not per address: the same box on two planes is
+        # still one NPU, and two lock files would be no lock at all. The
+        # addresses are handed over too, so a OneLane neighbour keyed on the
+        # address it used still takes turns with us.
+        self.locks[dev.id] = DeviceLock(
+            self._lock_host(dev),
+            neighbour_hosts=lambda d=dev: list(d.addresses.values()))
         return dev
 
+    @staticmethod
+    def _lock_host(dev):
+        """The address the lock file is named after.
+
+        It has to be the same string however the device was reached, or a box
+        addressed over USB by one process and over the LAN by another would take
+        out two different locks and serialise nothing. The serial is the stable
+        identity, so use it when there is one.
+        """
+        return dev.id or dev.address
+
+    @staticmethod
+    def _route(dev):
+        """How this device is being reached, for the card and the API."""
+        return {"gateway": dev.transport, "label": dev.transport_label,
+                "url": dev.gateway, "vhost_base": dev.vhost_base,
+                "plane": dev.active.name, "planes": dev.addresses,
+                "usb_linked": device_mod.usb_reachable(dev.addresses.get("usb"))
+                              if dev.addresses.get("usb") else None,
+                "route": dev.route_label}
+
+    def _save_route(self, device_id, plane, transport):
+        for entry in self.registry.entries:
+            if entry.get("id") == device_id:
+                if entry.get("plane") != plane or entry.get("transport") != transport:
+                    entry["plane"] = plane
+                    entry["transport"] = transport
+                    self.registry.save()
+                return
+
     def register(self, address, key=None, name=None, gateway=None, mgmt=None,
-                 discovery=None, device_id=None):
-        """Add a device. The address is enough; discovery fills in the rest."""
+                 discovery=None, device_id=None, vhost_base=None, planes=None):
+        """Add a device.
+
+        One address is enough. The device's own device.json reports every plane
+        it answers on, so a box plugged in over USB and joined to Wi-Fi
+        registers once, with both addresses, whichever one was used to find it.
+        """
         payload = device_mod.probe(address) if address and not device_id else None
         resolved_id = device_id or device_mod.identity(payload, address)
+        if planes is None and payload is not None:
+            found = device_mod.planes_from(payload, address)
+            if found:
+                planes = [plane.as_dict() for plane in found]
         entry = {"id": resolved_id,
                  "name": name or (payload or {}).get("device_name") or address or resolved_id,
                  "address": address,
                  "added_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
         if key:
             entry["key"] = key
-        for field, value in (("gateway", gateway), ("mgmt", mgmt), ("discovery", discovery)):
+        if planes:
+            entry["planes"] = [p.as_dict() if hasattr(p, "as_dict") else p
+                               for p in planes]
+        for field, value in (("gateway", gateway), ("mgmt", mgmt),
+                             ("discovery", discovery), ("vhost_base", vhost_base)):
             if value:
                 entry[field] = value
         self.registry.add(entry)
@@ -357,7 +453,8 @@ class Fleet:
         dev = self.get(device_id)
         value = {"id": dev.id, "name": dev.name, "address": dev.address,
                  "gateway": dev.gateway, "online": False, "error": None,
-                 "lock": {"busy": False, "waiting": 0, "shared": True, "held_for": None}}
+                 "lock": {"busy": False, "waiting": 0, "shared": True, "held_for": None},
+                 "transport": self._route(dev)}
         try:
             units = dev.npu_units()
             running = dev.running()
@@ -407,7 +504,10 @@ class Fleet:
             value["firmware"] = {"tiiny_os": info.get("tiiny_os"),
                                  "service": info.get("version"),
                                  "model": info.get("device_model_name"),
-                                 "serial": info.get("sn")}
+                                 # device_info carries no serial on this
+                                 # firmware; device.json does, and that is what
+                                 # the device is registered under.
+                                 "serial": dev.id}
         except device_mod.DeviceError as exc:
             value["error"] = str(exc)
         lock = self.locks.get(device_id)
@@ -415,6 +515,10 @@ class Fleet:
             value["lock"] = {"busy": lock.busy, "waiting": lock.waiting,
                              "shared": lock.shared, "reason": lock.reason,
                              "held_for": lock.held_for, "path": lock.path}
+        # Re-read after the calls above, which is where an unknown route gets
+        # resolved.
+        value["transport"] = self._route(dev)
+        value["address"] = dev.address
         with self._guard:
             self._cache[device_id] = {"at": now, "value": value}
         return value

@@ -57,8 +57,14 @@ class TestRecordedShapes(FakeFleetCase):
         # RUNBOOK.md: port 39218 serves /device.json with no credential at all.
         status, payload = get(self.fake.base, "/device.json", key=None)
         self.assertEqual(status, 200)
-        self.assertEqual(payload["sn"], self.fake.serial)
-        self.assertIn("device_name", payload)
+        # Verified against live firmware 2026-09-13: serial_number is the field,
+        # and the device reports every plane it answers on.
+        self.assertEqual(payload["serial_number"], self.fake.serial)
+        self.assertEqual(payload["discovery_token"], "GADGET_DISCOVER_V1")
+        self.assertEqual(payload["service"]["udp_discovery_port"], 39217)
+        interfaces = {row["interface"] for row in payload["ipv4_addresses"]}
+        self.assertEqual(interfaces, {"usb0", "wlan0"})
+        self.assertEqual(payload["usb"]["network"], "172.17.7.176/30")
 
     def test_device_info_is_unauthenticated(self):
         # API.md marks GET /api/v1/sys/device_info as the one open management route.
@@ -143,10 +149,17 @@ class TestRecordedShapes(FakeFleetCase):
         self.assertIn("model_id", payload[0])
 
     def test_storage_shape(self):
+        # Verified 2026-09-13: the real response wraps the body in a
+        # success/data envelope. The version inferred from prose did not, and
+        # nothing in Pocket reads this endpoint, so only checking it against
+        # hardware could have caught that.
         status, payload = get(self.fake.base, "/api/v1/models/storage")
         self.assertEqual(status, 200)
-        self.assertIn("models", payload)
-        self.assertIn("size_bytes", payload["models"][0])
+        self.assertIs(payload["success"], True)
+        data = payload["data"]
+        self.assertIn("total_size_bytes", data)
+        self.assertIn("model_count", data)
+        self.assertIn("size_bytes", data["models"][0])
 
     def test_start_and_stop_replies(self):
         model = "Qwen/Qwen3-Embedding-0.6B"

@@ -27,35 +27,49 @@ All three services share one port. The real device spreads them over 8800, 80
 and 39218, but the paths do not collide, so one listener is enough and it keeps
 the fake to a single address.
 
+With vhost_only=True the fake reproduces the firmware where port 8800 is closed
+to the LAN: a gateway path then needs the Host header the vendor CLI sends
+(p8800.api.tiiny for the model and NPU endpoints, openai.api.tiiny for the
+OpenAI-compatible surface), and without one it answers as the device management
+plane, exactly as port 80 does on real hardware.
+
 UNVERIFIED SHAPES
 -----------------
-Five responses could not be sourced from a recording. The specs declare them as
-free-form objects and no live body was captured, so what is below is inferred
-from adjacent evidence and is marked UNVERIFIED at each site. Confirm each one
-against a real device before trusting it; the checklist in the README covers
-them.
+Three responses still cannot be sourced from a recording. The specs declare them
+as free-form objects and no live body has been captured, so what is below is
+inferred from adjacent evidence and is marked UNVERIFIED at each site. Confirm
+each against a real device before trusting it; the checklist in the README
+covers them.
 
   1. POST /api/v1/models/{id}/download/stream, the SSE frame body. The spec
      documents that the endpoint streams progress and says nothing about the
      frame. Inferred from the get_progress fields plus speed_human, which is a
-     real OpenAIModel field.
+     real OpenAIModel field. Confirming it means starting a download, which is
+     a write, so it has been left alone.
   2. GET /api/v1/models/{id}/get_progress. Free-form in the spec. The field
      names come from tiiny-hud, which reads progress and status off it and
      works, so this is second hand rather than guessed.
-  3. GET /device.json on 39218. RUNBOOK.md records that it returns identity,
-     serial, MAC addresses and USB topology, but not the field names.
-  4. GET /api/v1/models/storage. Free-form in the spec; the per-model fields
-     come from RUNBOOK.md's prose about a failed download's storage record.
-  5. instance_id in the running instances list. Invented for realism; nothing
-     in Pocket reads it.
+  3. devices[].temp_c and power_w in /api/v1/npu/status. Declared by the spec;
+     confirmed present and null on live firmware, so the shape is right and
+     there is still no temperature on this REST surface.
+
+Verified against live hardware on 2026-09-13, and no longer guesses:
+
+  * GET /device.json, including the serial_number field, the discovery token,
+    the USB /30 and the per-interface address list.
+  * The UDP responder on 39217: send the advertised token, get device.json back.
+  * GET /api/v1/models/storage, and instance_id in the running instances list.
 """
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .device import GATEWAY_VHOST, OPENAI_VHOST
 
 KEY = "00000000-0000-4000-8000-000000000000"
 
@@ -129,7 +143,14 @@ class FakeState:
     """One fake device's mutable state, guarded for concurrent handlers."""
 
     def __init__(self, index=1, installed=None, loaded=None, npu_total=100,
-                 token_delay=0.0, request_ceiling=None, serial=None):
+                 token_delay=0.0, request_ceiling=None, serial=None,
+                 vhost_only=False):
+        # vhost_only reproduces the firmware where port 8800 is closed to the
+        # LAN: the gateway is then only reachable on port 80 by virtual host,
+        # and a request without the right Host header gets the management
+        # surface instead.
+        self.vhost_only = vhost_only
+        self.vhost_hits = 0
         self.index = index
         self.serial = serial or "TNYF260900000000%02dQ" % index
         self.name = "tiiny-fake-%d" % index
@@ -137,6 +158,11 @@ class FakeState:
         self.token_delay = token_delay
         # Scaled stand-in for the measured ~222s gateway ceiling.
         self.request_ceiling = request_ceiling
+        self.device_id = "8804fa89557e415f8055cf77d98c8ac%02d" % index
+        # Addresses the fake claims in its device.json. Tests override them so a
+        # box can be seen on two planes.
+        self.lan_address = None
+        self.usb_address = None
         self.installed = list(DEFAULT_INSTALLED if installed is None else installed)
         first = [m for m in self.installed if self._cost(m) >= 10][:1]
         self.loaded = list(first if loaded is None else loaded)
@@ -184,9 +210,9 @@ class FakeState:
     def running_payload(self):
         instances = []
         for offset, model_id in enumerate(self.loaded):
-            # model_id, port and npu_usage are read off a live device by
-            # tiiny-hud. instance_id is UNVERIFIED: invented here, read by
-            # nothing.
+            # All four verified against live firmware 2026-09-13. The real
+            # payload carries more per instance (created_at, capabilities,
+            # active_request_count); these are the ones Pocket reads.
             instances.append({"model_id": model_id, "port": 9098 + offset,
                               "npu_usage": self._cost(model_id),
                               "instance_id": "fake-%s-%d" % (self.serial, offset)})
@@ -234,16 +260,44 @@ class FakeState:
                 "peak_int8": "190 TOPS", "ram": "80 GB", "storage": "1 TB",
                 "network": "wifi"}
 
-    def device_json_payload(self, host_port):
-        # UNVERIFIED: RUNBOOK.md records what this endpoint returns in prose
-        # (identity, serial, MAC addresses, USB topology) but no field names.
-        # pocket.device.identity() therefore tries several spellings of the
-        # serial and falls back to the address, so a different field name
-        # degrades instead of breaking.
-        return {"device_name": self.name, "sn": self.serial,
-                "device_model": "Tiiny AI Pocket Lab", "tiiny_os": "0.1.33",
-                "addresses": {"lan": host_port, "usb": "172.17.7.177"},
-                "services": {"gateway": 8800, "management": 80, "discovery": 39218}}
+    def device_json_payload(self, host_port=None):
+        """Verified against live firmware on 2026-09-13.
+
+        This was the largest unverified shape in this file and is now a
+        recording: the field names, the discovery token, the USB /30 and the
+        per-interface address list are all as the device sends them. The address
+        list is what lets one box register once with both of its planes.
+        """
+        lan = self.lan_address or "192.168.100.94"
+        usb = self.usb_address or "172.17.7.177"
+        return {
+            "schema_version": "1",
+            "device_name": self.name,
+            "device_id": self.device_id,
+            "serial_number": self.serial,
+            "hostname": "tiinyhost",
+            "discovery_token": "GADGET_DISCOVER_V1",
+            "transport": ["lan", "usb"],
+            "service": {"instance_name": self.name, "dns_sd": "_gadget._tcp",
+                        "http_port": 39218, "http_path": "/device.json",
+                        "udp_discovery_port": 39217},
+            "backend": {"scheme": "http", "port": 0, "path": "/"},
+            "usb": {"interface": "usb0", "active": 1,
+                    "network": "172.17.7.176/30", "device_ip": usb,
+                    "host_ip": "172.17.7.178",
+                    "sn_derived_link_local_ipv6": "fe80::52ff:e2c5:f7a5:6d86",
+                    "link_local_ipv6": "fe80::52ff:e2c5:f7a5:6d86",
+                    "ipv6_addresses": ["fe80::52ff:e2c5:f7a5:6d86"],
+                    "device_mac": "02:ce:28:81:f3:01",
+                    "host_mac": "02:ce:28:81:f3:02"},
+            "ipv4_addresses": [{"interface": "usb0", "address": usb},
+                               {"interface": "wlan0", "address": lan}],
+            "ipv6_addresses": [
+                {"interface": "usb0", "address": "fe80::52ff:e2c5:f7a5:6d86",
+                 "scope": "link"},
+                {"interface": "wlan0",
+                 "address": "fd23:2dd7:c811:4229:e345:4f03:1396:fa37",
+                 "scope": "global"}]}
 
     def catalog_payload(self):
         out = []
@@ -259,15 +313,24 @@ class FakeState:
         return out
 
     def storage_payload(self):
-        # UNVERIFIED: free-form in the spec. The per-model fields come from
-        # RUNBOOK.md's description of a failed download's storage record
-        # (size_bytes, model_path, progress, error). Pocket reads disk usage
-        # from /api/v1/sys/status instead, so nothing depends on this.
+        """Verified 2026-09-13. This one was wrong.
+
+        The real response wraps everything in a success/data envelope, which the
+        earlier inferred version did not have. Nothing in Pocket reads this
+        endpoint, which is exactly why the mistake could sit here unnoticed, and
+        why checking it against hardware was worth doing.
+        """
         models = [{"model_id": m, "size_bytes": self._row(m)["size"],
+                   "size_human": "%.2f GB" % (self._row(m)["size"] / 1e9),
                    "model_path": "/data/models/%s" % m, "progress": 100.0,
                    "error": None} for m in self.installed]
-        return {"total_size_bytes": sum(m["size_bytes"] for m in models),
-                "model_count": len(models), "models": models}
+        total = sum(m["size_bytes"] for m in models)
+        return {"success": True,
+                "data": {"total_size_bytes": total,
+                         "total_size_human": "%.2f GB" % (total / 1e9),
+                         "total_unique_size_bytes": total,
+                         "total_shared_size_bytes": 0,
+                         "model_count": len(models), "models": models}}
 
 
 class FakeHandler(BaseHTTPRequestHandler):
@@ -299,6 +362,35 @@ class FakeHandler(BaseHTTPRequestHandler):
         self._send(401, {"code": 401, "msg": "Not authenticated"})
         return False
 
+    # Paths the device management plane serves on port 80 with no Host header.
+    MGMT_PREFIXES = ("/device.json", "/api/v1/sys/", "/health")
+
+    def _routed(self, path):
+        """Is this request addressed to the surface that serves this path?
+
+        Only enforced when the fake is in vhost_only mode. A gateway path then
+        needs the Host header the vendor CLI sends, and without one port 80
+        answers as the management UI, which is what the real device does.
+        """
+        if not self.state.vhost_only:
+            return True
+        if path.startswith(self.MGMT_PREFIXES):
+            return True
+        host = (self.headers.get("Host") or "").split(":")[0]
+        wanted = OPENAI_VHOST if path.startswith("/v1") else GATEWAY_VHOST
+        if host == wanted:
+            self.state.vhost_hits += 1
+            return True
+        return False
+
+    def _unrouted(self, path):
+        """What port 80 says to a gateway path with no usable Host header."""
+        if path == "/":
+            return self._send(200, {"service": "device management",
+                                    "device_name": self.state.name})
+        return self._send(404, {"code": 404, "msg": "Not Found",
+                                "detail": "no route for %s on this virtual host" % path})
+
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
@@ -327,10 +419,11 @@ class FakeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         state = self.state
+        if not self._routed(path):
+            return self._unrouted(path)
 
         if path == "/device.json":
-            host = self.headers.get("Host") or "127.0.0.1"
-            return self._send(200, state.device_json_payload(host))
+            return self._send(200, state.device_json_payload())
         if path == "/api/v1/sys/device_info":
             return self._send(200, state.device_info_payload())
         if path == "/health":
@@ -367,9 +460,9 @@ class FakeHandler(BaseHTTPRequestHandler):
         return self._send(404, {"code": 404, "msg": "Not Found"})
 
     def _progress(self, model_id):
-        # UNVERIFIED, second hand: the spec declares this response free-form.
-        # The status and progress field names come from tiiny-hud, which reads
-        # them off a live device and works.
+        # Verified 2026-09-13 for a model already on disk: the device answers
+        # {model_id, fullname, status, progress}. The downloading case is still
+        # inferred, because confirming it means starting a download.
         state = self.state
         with state.guard:
             job = state.downloads.get(model_id)
@@ -393,6 +486,8 @@ class FakeHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ POST
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
+        if not self._routed(path):
+            return self._unrouted(path)
         if not self._authed():
             return None
         state = self.state
@@ -418,6 +513,8 @@ class FakeHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urllib.parse.urlsplit(self.path).path
+        if not self._routed(path):
+            return self._unrouted(path)
         if not self._authed():
             return None
         state = self.state
@@ -658,16 +755,79 @@ class FakeServer(ThreadingHTTPServer):
 
 class FakeDevice:
     """A fake Tiiny on an ephemeral port. Use as a context manager or call
-    start() and stop()."""
+    start() and stop().
 
-    def __init__(self, index=1, host="127.0.0.1", port=0, **kwargs):
+    `planes` starts one listener per addressing plane, all sharing one state, so
+    a single fake box answers on several addresses at once exactly as real
+    hardware does over USB and Wi-Fi together. The planes differ by port rather
+    than by address because loopback aliases are not portable, and nothing in
+    Pocket cares which of the two a plane's base URL varies by.
+    """
+
+    def __init__(self, index=1, host="127.0.0.1", port=0, planes=None, **kwargs):
         self.state = FakeState(index=index, **kwargs)
-        self.server = FakeServer(self.state, host, port)
-        self.port = self.server.server_address[1]
         self.host = host
-        self.base = "http://%s:%d" % (host, self.port)
         self.key = KEY
-        self.thread = None
+        self.threads = []
+        names = list(planes or ["lan"])
+        self.servers = {}
+        self.bases = {}
+        for offset, name in enumerate(names):
+            server = FakeServer(self.state, host, port if offset == 0 else 0)
+            self.servers[name] = server
+            self.bases[name] = "http://%s:%d" % (host, server.server_address[1])
+        self.plane_names = names
+        self.server = self.servers[names[0]]
+        self.port = self.server.server_address[1]
+        self.base = self.bases[names[0]]
+
+    def plane_records(self):
+        """Plane dicts ready to hand to Fleet.register.
+
+        A vhost-only fake points each plane's direct gateway at a closed port,
+        so every plane has to fall back to the virtual host, which is what the
+        firmware with port 8800 shut actually does.
+        """
+        out = []
+        for name in self.plane_names:
+            base = self.bases[name]
+            # The port is what actually distinguishes one fake plane from
+            # another, so it belongs in the address: two planes both reading
+            # "127.0.0.1" would be indistinguishable on the device card.
+            out.append({"name": name,
+                        "address": "%s:%d" % (self.host,
+                                              self.servers[name].server_address[1]),
+                        "interface": "usb0" if name == "usb" else "wlan0",
+                        "gateway": self.gateway_base_for(name), "mgmt": base,
+                        "discovery": base, "vhost_base": base})
+        return out
+
+    def gateway_base_for(self, name):
+        base = self.bases[name]
+        if not self.state.vhost_only:
+            return base
+        key = "_closed_" + name
+        if getattr(self, key, None) is None:
+            setattr(self, key, closed_port(self.host))
+        return "http://%s:%d" % (self.host, getattr(self, key))
+
+    def stop_plane(self, name):
+        """Pull one plane's cable."""
+        server = self.servers.pop(name, None)
+        if server is None:
+            return
+        server.shutdown()
+        server.server_close()
+        self.plane_names = [n for n in self.plane_names if n != name]
+
+    @property
+    def vhost_only(self):
+        return self.state.vhost_only
+
+    @property
+    def gateway_base(self):
+        """What to hand Pocket as the direct gateway URL for the first plane."""
+        return self.gateway_base_for(self.plane_names[0])
 
     @property
     def serial(self):
@@ -678,16 +838,22 @@ class FakeDevice:
         return self.state.name
 
     def start(self):
-        self.thread = threading.Thread(target=self.server.serve_forever,
-                                       kwargs={"poll_interval": 0.1}, daemon=True)
-        self.thread.start()
+        for server in self.servers.values():
+            thread = threading.Thread(target=server.serve_forever,
+                                      kwargs={"poll_interval": 0.1}, daemon=True)
+            thread.start()
+            self.threads.append(thread)
         return self
 
     def stop(self):
-        self.server.shutdown()
-        self.server.server_close()
-        if self.thread is not None:
-            self.thread.join(timeout=5)
+        for server in list(self.servers.values()):
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+        for thread in self.threads:
+            thread.join(timeout=5)
 
     def __enter__(self):
         return self.start()
@@ -697,9 +863,81 @@ class FakeDevice:
         return False
 
 
-def fleet_of(count, **kwargs):
+class FakeDiscovery:
+    """The UDP responder device.json advertises.
+
+    Send it the discovery token and it answers with the whole device.json, which
+    is exactly what live firmware does on port 39217. Bound to an ephemeral port
+    here so a test never fights with the real one.
+    """
+
+    def __init__(self, state, host="127.0.0.1", port=0):
+        self.state = state
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.port = self.sock.getsockname()[1]
+        self.host = host
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        return self
+
+    def _serve(self):
+        self.sock.settimeout(0.2)
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if data.strip() != b"GADGET_DISCOVER_V1":
+                continue
+            try:
+                self.sock.sendto(
+                    json.dumps(self.state.device_json_payload()).encode(), addr)
+            except OSError:
+                break
+
+    def stop(self):
+        self.running = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if self.thread is not None:
+            self.thread.join(timeout=3)
+
+
+def closed_port(host="127.0.0.1"):
+    """A port nothing is listening on, so connecting to it is refused.
+
+    Bind it, read the number the kernel picked, drop it. Something else could
+    claim it in the gap, which is why this is only used by tests: a stray
+    listener would make the refused-transport test fail loudly rather than pass
+    for the wrong reason.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+
+
+def fleet_of(count, planes_for_first=None, **kwargs):
     """Start `count` fake devices, each with a different mix of models loaded so
-    the routing and the union in /v1/models have something to do."""
+    the routing and the union in /v1/models have something to do.
+
+    planes_for_first gives the first box more than one addressing plane, which
+    is what a real Tiiny looks like when it is plugged in over USB and joined to
+    Wi-Fi at the same time.
+    """
     spreads = [
         (DEFAULT_INSTALLED, ["deepreinforce-ai/Ornith-1.0-35B"]),
         (["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", "Qwen/Qwen3-Embedding-0.6B",
@@ -712,5 +950,7 @@ def fleet_of(count, **kwargs):
     for index in range(count):
         installed, loaded = spreads[index % len(spreads)]
         devices.append(FakeDevice(index=index + 1, installed=list(installed),
-                                  loaded=list(loaded), **kwargs).start())
+                                  loaded=list(loaded),
+                                  planes=planes_for_first if index == 0 else None,
+                                  **kwargs).start())
     return devices

@@ -182,7 +182,13 @@ function deviceCard(device) {
   card.appendChild(head);
 
   var firmware = device.firmware || {};
-  var subParts = [device.address || device.gateway];
+  var route = device.transport || {};
+  var planes = route.planes || {};
+  var subParts = [];
+  Object.keys(planes).forEach(function (name) {
+    subParts.push(name + ' ' + planes[name] + (name === route.plane ? ' *' : ''));
+  });
+  if (!subParts.length) subParts.push(device.address || device.gateway);
   if (firmware.tiiny_os) subParts.push('TiinyOS ' + firmware.tiiny_os);
   if (firmware.serial) subParts.push(firmware.serial);
   card.appendChild(el('div', 'device-sub', subParts.join('  ·  ')));
@@ -213,6 +219,16 @@ function deviceCard(device) {
     ? 'in use' + (lock.held_for ? ' for ' + lock.held_for + 's' : '')
     : 'idle';
   if (lock.waiting) lockText += ', ' + lock.waiting + ' waiting';
+  // Which address and which transport this device is actually being reached
+  // on. Worth showing: on firmware with port 8800 closed the gateway is only
+  // reachable by host header on port 80, and USB is preferred over DHCP.
+  meta.appendChild(el('dt', null, 'gateway'));
+  var via = route.gateway === 'vhost'
+    ? 'via host header on :80' : (route.gateway === 'direct'
+      ? 'via port 8800' : 'not determined yet');
+  if (route.plane) via += '  ·  over ' + route.plane;
+  if (route.usb_linked === false && planes.usb) via += ' (usb cable not in this host)';
+  meta.appendChild(el('dd', null, via));
   meta.appendChild(el('dt', null, 'lock'));
   meta.appendChild(el('dd', null, lockText + (lock.shared ? ' (shared)' : ' (this process only)')));
   meta.appendChild(el('dt', null, 'thermals'));
@@ -247,10 +263,15 @@ function deviceCard(device) {
   }
   card.appendChild(loaded);
 
+  // Some firmware pins this at zero even mid-generation, and some reports a
+  // real figure. Only carry the caveat when the number is actually stuck.
   if (memory.utilization_percent === 0) {
     card.appendChild(el('div', 'device-note',
-      'NPU utilisation reads 0% on this firmware even mid-generation, so it is not ' +
-      'shown as a load signal. Memory and unit accounting are live.'));
+      'NPU utilisation reads 0% on this firmware even mid-generation, so it is ' +
+      'not shown as a load signal. Memory and unit accounting are live.'));
+  } else if (memory.utilization_percent) {
+    card.appendChild(el('div', 'device-note',
+      'NPU utilisation ' + Number(memory.utilization_percent).toFixed(1) + '%'));
   }
   return card;
 }
@@ -262,11 +283,22 @@ function wireAdd() {
     card.hidden = !card.hidden;
   };
   $('#do-discover').onclick = function () {
+    // With no address this is the automatic sweep: a UDP broadcast plus any
+    // USB link this host is plugged into.
     var address = $('#add-address').value.trim();
-    if (!address) return toast('enter an address', true);
-    api('/api/discover', { method: 'POST', body: { address: address } })
-      .then(function (payload) { renderFound(payload.found); })
-      .catch(function (err) { toast(err.message, true); });
+    var button = this;
+    button.disabled = true;
+    button.textContent = address ? 'Checking' : 'Looking';
+    api('/api/discover', { method: 'POST', body: address ? { address: address } : { auto: true } })
+      .then(function (payload) {
+        renderFound(payload.found);
+        if (!address) toast(payload.found.length + ' device(s) found');
+      })
+      .catch(function (err) { toast(err.message, true); })
+      .then(function () {
+        button.disabled = false;
+        button.textContent = 'Find devices';
+      });
   };
   $('#do-scan').onclick = function () {
     var subnet = $('#add-subnet').value.trim();
@@ -298,20 +330,30 @@ function renderFound(found) {
   if (!found || !found.length) { box.appendChild(el('div', 'empty', 'nothing found')); return; }
   found.forEach(function (hit) {
     var row = el('div', 'loaded-row');
-    row.appendChild(el('span', 'dot'));
-    row.appendChild(el('code', null, hit.address));
-    row.appendChild(el('span', 'meta',
-      (hit.device.device_name || '?') + '  ·  ' + (hit.device.sn || '')));
-    var add = el('button', 'btn small', 'Add');
-    add.onclick = function () { addDevice(hit.address, $('#add-key').value.trim()); };
-    row.appendChild(add);
+    row.appendChild(el('span', 'dot' + (hit.known ? '' : ' off')));
+    row.appendChild(el('code', null, hit.name || hit.serial));
+    // A box answers on USB and Wi-Fi at once and reports both, so show both:
+    // it registers once, with every address it has.
+    var where = Object.keys(hit.addresses || {}).map(function (name) {
+      return name + ' ' + hit.addresses[name];
+    }).join('  ');
+    row.appendChild(el('span', 'meta', where + (hit.known ? '  already added' : '')));
+    if (!hit.known) {
+      var add = el('button', 'btn small', 'Add');
+      add.onclick = function () {
+        addDevice(hit.address, $('#add-key').value.trim(), hit.planes, hit.name);
+      };
+      row.appendChild(add);
+    }
     box.appendChild(row);
   });
 }
 
-function addDevice(address, key) {
+function addDevice(address, key, planes, name) {
   if (!address) return toast('enter an address', true);
-  api('/api/devices', { method: 'POST', body: { address: address, key: key || '' } })
+  api('/api/devices', { method: 'POST',
+                        body: { address: address, key: key || '',
+                                planes: planes || null, name: name || null } })
     .then(function (payload) {
       if (payload.telemetry && payload.telemetry.error) {
         toast('added, but it did not answer: ' + payload.telemetry.error, true);
@@ -437,7 +479,8 @@ function paintCatalog(rows) {
     tr.appendChild(el('td', 'id', model.model_id));
     tr.appendChild(el('td', null, model.type));
     tr.appendChild(el('td', 'num', model.params));
-    tr.appendChild(el('td', 'num', bytes(model.size)));
+    // The live catalog reports no size for a model that is not installed.
+    tr.appendChild(el('td', 'num', model.size ? bytes(model.size) : '-'));
     tr.appendChild(el('td', 'num', model.npu_usage || '-'));
     var act = el('td', 'act');
     if (model.installed) {
