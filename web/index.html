@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINode Pocket</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="shell">
+
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">AI<span>Node</span></div>
+      <div class="sidebar-sub">Pocket</div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="overview"><span class="nav-glyph">◧</span>Overview</button>
+      <button class="nav-item" data-view="models"><span class="nav-glyph">◆</span>Models</button>
+      <button class="nav-item" data-view="chat"><span class="nav-glyph">◈</span>Chat</button>
+      <button class="nav-item" data-view="bench"><span class="nav-glyph">⊞</span>Bench</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="endpoint-mini">
+        <div class="endpoint-mini-label">Endpoint</div>
+        <code id="mini-endpoint">http://127.0.0.1:8430/v1</code>
+      </div>
+      <div class="sidebar-version" id="version">v0.1.0</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title" id="view-title">Overview</div>
+      <div class="topbar-stats" id="topbar-stats"></div>
+      <button class="btn ghost" id="refresh">Refresh</button>
+    </header>
+
+    <div class="scroll">
+
+      <!-- ── Overview ─────────────────────────────────────────────── -->
+      <section class="view" id="view-overview">
+        <div class="summary" id="summary"></div>
+
+        <div class="card endpoint-card">
+          <div class="card-header">
+            <div class="card-title">One endpoint for the fleet</div>
+            <span class="pill" id="endpoint-pill">OpenAI-compatible</span>
+          </div>
+          <div class="endpoint-row">
+            <code id="endpoint-url">http://127.0.0.1:8430/v1</code>
+            <button class="btn small" id="copy-endpoint">Copy</button>
+          </div>
+          <p class="muted">
+            <code>/v1/models</code> is the union across every registered device.
+            <code>/v1/chat/completions</code> routes by model id to a device that
+            has it loaded, one request at a time per device, so concurrent callers
+            queue instead of failing with device error 150004.
+          </p>
+          <pre class="snippet" id="curl-snippet"></pre>
+        </div>
+
+        <div class="section-head">
+          <h2>Devices</h2>
+          <button class="btn small" id="show-add">Add a device</button>
+        </div>
+
+        <div class="card add-card" id="add-card" hidden>
+          <div class="card-header"><div class="card-title">Add a device</div></div>
+          <div class="form-row">
+            <label>Address<input id="add-address" placeholder="192.168.100.70"></label>
+            <label>API key <span class="muted">optional</span>
+              <input id="add-key" type="password" placeholder="found automatically if blank"></label>
+            <button class="btn" id="do-discover">Check</button>
+            <button class="btn primary" id="do-add">Add</button>
+          </div>
+          <p class="muted">
+            The key is read from <code>~/.tiinyapps/device.json</code> or the
+            TiinyOS app's local storage when you leave it blank. Nothing is
+            written into this repository.
+          </p>
+          <div class="form-row">
+            <label>Scan a subnet <span class="muted">opt-in</span>
+              <input id="add-subnet" placeholder="192.168.100"></label>
+            <button class="btn" id="do-scan">Scan</button>
+          </div>
+          <p class="muted">
+            A scan probes 254 addresses for an unauthenticated discovery
+            responder on port 39218. It touches nothing else.
+          </p>
+          <div id="add-result"></div>
+        </div>
+
+        <div class="device-grid" id="devices"></div>
+      </section>
+
+      <!-- ── Models ───────────────────────────────────────────────── -->
+      <section class="view" id="view-models" hidden>
+        <div class="tabs" id="model-tabs"></div>
+        <div id="npu-budget"></div>
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">Installed on this device</div>
+            <span class="muted" id="installed-count"></span>
+          </div>
+          <div class="table-wrap"><table class="table" id="installed-table"></table></div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">Catalog</div>
+            <span class="muted">Downloadable to this device</span>
+          </div>
+          <div class="table-wrap"><table class="table" id="catalog-table"></table></div>
+        </div>
+      </section>
+
+      <!-- ── Chat ─────────────────────────────────────────────────── -->
+      <section class="view" id="view-chat" hidden>
+        <div class="chat-bar">
+          <label>Model<select id="chat-model"></select></label>
+          <span class="muted" id="chat-route"></span>
+          <label class="check"><input type="checkbox" id="chat-stream" checked>Stream</label>
+        </div>
+        <div class="chat-log" id="chat-log">
+          <div class="chat-empty">
+            <div class="chat-empty-mark">◈</div>
+            <p>This page talks to <code>/v1/chat/completions</code> on this app,
+               the same endpoint your own clients use. Pick a loaded model and ask
+               it something.</p>
+          </div>
+        </div>
+        <form class="chat-compose" id="chat-form">
+          <textarea id="chat-input" rows="2" placeholder="Ask the fleet something..."></textarea>
+          <button class="btn primary" id="chat-send" type="submit">Send</button>
+        </form>
+      </section>
+
+      <!-- ── Bench ────────────────────────────────────────────────── -->
+      <section class="view" id="view-bench" hidden>
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">Run a benchmark</div>
+            <span class="muted">Nothing is loaded, unloaded or deleted</span>
+          </div>
+          <div class="form-row">
+            <label>Device<select id="bench-device"></select></label>
+            <label>Label<input id="bench-label" placeholder="first-run"></label>
+            <button class="btn primary" id="bench-run">Run</button>
+          </div>
+          <div class="checks" id="bench-tests">
+            <label class="check"><input type="checkbox" value="prefill" checked>prefill</label>
+            <label class="check"><input type="checkbox" value="sustained" checked>sustained</label>
+            <label class="check"><input type="checkbox" value="concurrency" checked>concurrency</label>
+            <label class="check"><input type="checkbox" value="thinking" checked>thinking</label>
+          </div>
+          <p class="muted">
+            The suite is tiiny-bench, embedded. Requests take their turn through
+            the device lock, so the concurrency rows measure queueing rather than
+            collisions.
+          </p>
+          <pre class="log" id="bench-log">No run yet.</pre>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">Past results</div>
+            <span class="muted" id="bench-count"></span>
+          </div>
+          <div class="table-wrap"><table class="table" id="bench-table"></table></div>
+          <pre class="log" id="bench-detail" hidden></pre>
+        </div>
+      </section>
+
+    </div>
+
+    <footer class="footer">
+      <span>AINode Pocket <span id="footer-version">0.1.0</span></span>
+      <span class="footer-right">
+        Powered by <a href="https://argentos.ai" target="_blank" rel="noopener">argentos.ai</a>
+      </span>
+    </footer>
+  </main>
+</div>
+<div class="toast" id="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

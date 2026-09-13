@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""AINode Pocket: one command, one endpoint, one page for your Tiiny devices.
+
+    python3 ainode-pocket --serve                 start the web app on 0.0.0.0:8430
+    python3 ainode-pocket --serve --fake 2        same, against two fake devices
+    python3 ainode-pocket --device 192.168.100.70 register a device and exit
+    python3 ainode-pocket --scan 192.168.100      look for devices on a subnet
+    python3 ainode-pocket --bench --device <id> --label first-run
+    python3 ainode-pocket --selfcheck             offline check, no hardware
+
+Standard library only, Python 3.9+.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from pocket import __version__, bench as bench_mod, device as device_mod  # noqa: E402
+from pocket import fake as fake_mod, server as server_mod  # noqa: E402
+from pocket.fleet import Fleet, Registry, data_dir  # noqa: E402
+
+BANNER = "AINode Pocket %s  ·  Powered by argentos.ai" % __version__
+
+
+def lan_address():
+    """The address this machine answers on, for the second URL worth printing.
+
+    A server bound to 0.0.0.0 is reachable at both localhost and the LAN
+    address, and only one of those works from another machine, so print both.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))  # a reserved address; nothing is sent
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def build_fleet(count, registry_path=None):
+    """A fleet of fake devices in this process, registered in a throwaway file.
+
+    The fake registry never touches the real one, so --fake cannot bury a user's
+    actual devices under demo entries.
+    """
+    fakes = fake_mod.fleet_of(count)
+    path = registry_path or os.path.join(tempfile.mkdtemp(prefix="ainode-pocket-fake-"),
+                                         "devices.json")
+    fleet = Fleet(Registry(path))
+    for fake in fakes:
+        fleet.register(fake.host, key=fake.key, name=fake.name,
+                       gateway=fake.base, mgmt=fake.base, discovery=fake.base,
+                       device_id=fake.serial)
+    return fleet, fakes
+
+
+def cmd_serve(args):
+    if args.fake:
+        fleet, fakes = build_fleet(args.fake)
+        print("%s\nfake mode: %d device(s) in this process, real devices untouched"
+              % (BANNER, len(fakes)))
+        for fake in fakes:
+            print("  %-16s %s" % (fake.name, fake.base))
+    else:
+        fleet, fakes = Fleet(), []
+        print(BANNER)
+        if not fleet.devices:
+            print("no devices registered yet. Add one on the Devices page, or run")
+            print("  python3 ainode-pocket --device <address>")
+
+    app = server_mod.App(fleet, fakes)
+    httpd = server_mod.serve(app, args.host, args.port)
+    lan = lan_address()
+    print("\nweb app and endpoint:")
+    print("  Local:    http://127.0.0.1:%d" % args.port)
+    if lan:
+        print("  LAN:      http://%s:%d" % (lan, args.port))
+    print("\nOpenAI-compatible base URL for your own clients:")
+    print("  http://127.0.0.1:%d/v1" % args.port)
+    if lan:
+        print("  http://%s:%d/v1" % (lan, args.port))
+    print("\nctrl+c to stop")
+    try:
+        httpd.serve_forever(poll_interval=0.2)
+    except KeyboardInterrupt:
+        print("\nstopping")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        for fake in fakes:
+            fake.stop()
+    return 0
+
+
+def cmd_device(args):
+    fleet = Fleet()
+    address = args.device
+    payload = device_mod.probe(address)
+    if payload:
+        print("found %s at %s" % (payload.get("device_name") or "a Tiiny", address))
+    else:
+        print("no discovery responder at http://%s:%d/device.json; registering anyway"
+              % (address, device_mod.DISCOVERY_PORT))
+    key = args.key or device_mod.find_key()
+    if not key:
+        print("no API key found. Set TIINY_KEY, run `farm device`, or pass --key.")
+        return 2
+    dev = fleet.register(address, key=key, name=args.name)
+    telemetry = fleet.telemetry(dev.id, force=True)
+    if telemetry.get("error"):
+        print("registered %s, but it did not answer: %s" % (dev.id, telemetry["error"]))
+        return 1
+    units = telemetry.get("npu_units") or {}
+    print("registered %s (%s)" % (dev.name, dev.id))
+    print("  NPU %s/%s units   loaded: %s"
+          % (units.get("used"), units.get("total"),
+             ", ".join(telemetry.get("running") or []) or "nothing"))
+    print("  registry: %s" % fleet.registry.path)
+    return 0
+
+
+def cmd_discover(args):
+    if args.scan:
+        print("scanning %s.0/24 for discovery responders on port %d ..."
+              % (args.scan.split("/")[0].rsplit(".", 1)[0] if args.scan.count(".") == 3
+                 else args.scan, device_mod.DISCOVERY_PORT))
+        hits = device_mod.scan(args.scan)
+    else:
+        payload = device_mod.probe(args.discover)
+        hits = [(args.discover, payload)] if payload else []
+    if not hits:
+        print("nothing found")
+        return 1
+    for address, payload in hits:
+        print("%-16s %-22s %s" % (address, payload.get("device_name") or "?",
+                                  payload.get("sn") or ""))
+    print("\nregister one with: python3 ainode-pocket --device <address>")
+    return 0
+
+
+def cmd_bench(args):
+    fleet = Fleet()
+    if not args.device:
+        print("which device? registered:")
+        for device_id, dev in fleet.devices.items():
+            print("  %-28s %s" % (device_id, dev.name))
+        return 2
+    only = [part.strip() for part in (args.only or "").split(",") if part.strip()] or None
+    run = bench_mod.start(fleet, args.device, args.label or "cli", only)
+    seen = 0
+    while run.state == "running":
+        snapshot = run.snapshot()
+        for line in snapshot["lines"][seen:]:
+            print(line)
+        seen = len(snapshot["lines"])
+        time.sleep(0.4)
+    for line in run.snapshot()["lines"][seen:]:
+        print(line)
+    return 0 if run.state == "done" else 1
+
+
+def cmd_results(args):
+    if args.show:
+        print(json.dumps(bench_mod.load(args.show), indent=2)[:8000])
+        return 0
+    rows = bench_mod.history()
+    if not rows:
+        print("no saved benchmark results in %s" % bench_mod.results_dir())
+        return 0
+    for row in rows:
+        print("%-34s %-18s %-28s %s tok/s"
+              % (row["saved_as"], row.get("label") or "", row.get("model") or "",
+                 row.get("decode_tok_s") or "-"))
+    return 0
+
+
+def cmd_selfcheck(args):
+    """Prove the whole path works with no hardware and no network.
+
+    The farm's CI runs this offline with a 120 second limit, so everything here
+    is loopback only and finishes in about a second.
+    """
+    failures = []
+
+    def check(name, condition, detail=""):
+        status = "ok  " if condition else "FAIL"
+        print("  %s %s%s" % (status, name, ("  " + detail) if detail and not condition else ""))
+        if not condition:
+            failures.append(name)
+
+    print("%s\nselfcheck (fake device, loopback only)" % BANNER)
+    workdir = tempfile.mkdtemp(prefix="ainode-pocket-selfcheck-")
+    os.environ["AINODE_POCKET_DIR"] = workdir
+    fleet, fakes = build_fleet(1, os.path.join(workdir, "devices.json"))
+    app = server_mod.App(fleet, fakes)
+    httpd = server_mod.serve(app, "127.0.0.1", 0)
+    port = httpd.server_address[1]
+    import threading
+    import urllib.error
+    import urllib.request
+    thread = threading.Thread(target=httpd.serve_forever,
+                              kwargs={"poll_interval": 0.1}, daemon=True)
+    thread.start()
+    base = "http://127.0.0.1:%d" % port
+
+    def get(path):
+        with urllib.request.urlopen(base + path, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+
+    def post(path, body):
+        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode() or "{}")
+
+    try:
+        status, health = get("/healthz")
+        check("healthz", status == 200 and health.get("ok") is True)
+        status, state = get("/api/state")
+        check("device telemetry", status == 200 and state["devices"][0]["online"] is True,
+              str(state.get("devices")))
+        status, models = get("/v1/models")
+        ready = [row for row in models.get("data", []) if row["ainode_pocket"]["ready"]]
+        check("/v1/models union", status == 200 and bool(ready))
+        check("web assets present", os.path.isfile(os.path.join(server_mod.WEB_DIR,
+                                                               "index.html")))
+        if ready:
+            status, reply = post("/v1/chat/completions", {
+                "model": ready[0]["id"], "max_tokens": 24,
+                "messages": [{"role": "user", "content": "hello"}]})
+            text = ((reply.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+            check("/v1/chat/completions", status == 200 and bool(text), json.dumps(reply)[:200])
+            status, refusal = post("/v1/chat/completions", {
+                "model": "nobody/has-this", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]})
+            check("503 names the reason", status == 503
+                  and "fleet" in refusal["error"]["message"])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        for fake in fakes:
+            fake.stop()
+        with contextlib.suppress(OSError):
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    if failures:
+        print("\n%d check(s) failed: %s" % (len(failures), ", ".join(failures)))
+        return 1
+    print("\nall checks passed")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ainode-pocket",
+        description="Manage a fleet of Tiiny AI Pocket Labs and serve one "
+                    "OpenAI-compatible endpoint in front of them.")
+    parser.add_argument("--serve", action="store_true",
+                        help="start the web app and the endpoint")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="bind address (default 0.0.0.0 so the LAN can reach it)")
+    parser.add_argument("--port", type=int, default=server_mod.PORT,
+                        help="port (default %d)" % server_mod.PORT)
+    parser.add_argument("--fake", type=int, metavar="N",
+                        help="serve against N fake devices instead of real hardware")
+    parser.add_argument("--device", metavar="ADDRESS",
+                        help="register a device by address and exit")
+    parser.add_argument("--key", help="API key for --device (otherwise discovered)")
+    parser.add_argument("--name", help="friendly name for --device")
+    parser.add_argument("--discover", metavar="ADDRESS",
+                        help="read /device.json from one address")
+    parser.add_argument("--scan", metavar="SUBNET",
+                        help="probe a /24 for devices, for example 192.168.100")
+    parser.add_argument("--bench", action="store_true", help="run the benchmark")
+    parser.add_argument("--label", help="label for a benchmark run")
+    parser.add_argument("--only", help="benchmark subset: prefill,sustained,"
+                                       "concurrency,thinking")
+    parser.add_argument("--results", action="store_true", help="list saved results")
+    parser.add_argument("--show", metavar="FILE", help="print one saved result")
+    parser.add_argument("--selfcheck", action="store_true",
+                        help="offline check with a fake device, for CI")
+    parser.add_argument("--version", action="version", version=BANNER)
+    args = parser.parse_args(argv)
+
+    if args.selfcheck:
+        return cmd_selfcheck(args)
+    if args.bench:
+        return cmd_bench(args)
+    if args.results or args.show:
+        return cmd_results(args)
+    if args.discover or args.scan:
+        return cmd_discover(args)
+    if args.device:
+        return cmd_device(args)
+    if args.serve:
+        return cmd_serve(args)
+    parser.print_help()
+    print("\ndata directory: %s" % data_dir())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+.venv/
+# Never commit device credentials or local state. Keys live in
+# ~/.tiinyapps/device.json or ~/.ainode-pocket/, never in the repo.
+devices.json
+device.json
+*.key
+bench-results/
