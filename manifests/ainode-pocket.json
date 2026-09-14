@@ -3,7 +3,7 @@
   "name": "AINode Pocket",
   "pitch": "One endpoint and one page for every Tiiny you own.",
   "description": "Registers one or many Tiiny AI Pocket Labs, shows what each one is doing, manages the models on them, and puts a single OpenAI-compatible endpoint in front of the fleet. /v1/models is the union across your devices and /v1/chat/completions routes by model id to a device that has that model loaded. Requests to one device are serialised through a per-device lock, so several callers queue and get answers instead of colliding with device error 150004, and when nothing can serve a request the 503 says which device holds the model and what to do about it. Includes a chat page that uses the same endpoint and the tiiny-bench suite embedded as a page and a CLI subcommand. Python standard library only, no pip dependencies, no accounts, no cloud.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": {
     "name": "Jason Brashear",
     "url": "https://github.com/webdevtodayjason",

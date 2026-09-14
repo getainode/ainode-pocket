@@ -19,7 +19,7 @@ from . import device as device_mod
 from . import gateway
 from .fleet import Fleet, NoDevice
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 PORT = 8430
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
