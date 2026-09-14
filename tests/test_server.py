@@ -70,10 +70,17 @@ class TestRoutes(ServerCase):
             self.assertEqual(status, 200, path)
             self.assertIn(needle, body)
 
-    def test_the_footer_credits_argentos(self):
+    def test_the_footer_says_where_it_was_made(self):
         status, body = self.request("/")
-        self.assertIn("Powered by", body)
-        self.assertIn("argentos.ai", body)
+        self.assertEqual(status, 200)
+        self.assertIn("Made in Texas", body)
+        # The silhouette is inline, sized, and hidden from screen readers so the
+        # text next to it is the only thing announced.
+        self.assertIn('class="texas"', body)
+        self.assertIn('aria-hidden="true"', body)
+        self.assertIn('fill="currentColor"', body)
+        self.assertIn('width="14"', body)
+        self.assertNotIn("argentos", body)
 
     def test_a_missing_route_is_a_json_404(self):
         status, payload = self.request("/nope")

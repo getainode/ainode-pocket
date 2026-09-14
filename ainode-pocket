@@ -30,7 +30,7 @@ from pocket import __version__, bench as bench_mod, device as device_mod  # noqa
 from pocket import fake as fake_mod, server as server_mod  # noqa: E402
 from pocket.fleet import Fleet, Registry, data_dir  # noqa: E402
 
-BANNER = "AINode Pocket %s  ·  Powered by argentos.ai" % __version__
+BANNER = "AINode Pocket %s  ·  Made in Texas" % __version__
 
 
 def lan_address():

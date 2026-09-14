@@ -109,6 +109,9 @@ a:hover { color: var(--green-bright); }
   border-top: 1px solid var(--border); background: rgba(10, 10, 10, .9);
   font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
 }
+.footer-right { display: inline-flex; align-items: center; gap: 6px; }
+/* Sits on the text baseline rather than floating above it. */
+.texas { flex: 0 0 auto; opacity: .85; }
 
 /* ── cards and bits ───────────────────────────────────────────────── */
 .card {

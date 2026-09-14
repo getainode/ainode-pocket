@@ -428,4 +428,4 @@ tests/                 140 tests, no hardware
 manifests/             the tiinyapp.farm manifest
 ```
 
-Apache 2.0. Powered by [argentos.ai](https://argentos.ai).
+Apache 2.0. Made in Texas.
