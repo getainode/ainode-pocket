@@ -5,6 +5,9 @@ var state = null;
 var view = 'overview';
 var modelDevice = null;
 var benchPoll = null;
+// A run is in flight. The state refresh repaints the bench controls every few
+// seconds and must not hand the Run button back while the suite is working.
+var benchBusy = false;
 var chatBusy = false;
 
 /* ── helpers ─────────────────────────────────────────────────────── */
@@ -743,7 +746,54 @@ function fillBenchDevices() {
     option.value = device.id;
     select.appendChild(option);
   });
-  if (previous) select.value = previous;
+  if (previous && [].some.call(select.options,
+                               function (o) { return o.value === previous; })) {
+    select.value = previous;
+  }
+  fillBenchModels();
+}
+
+// Every section of the suite is a chat completion, so the list is the loaded
+// chat models on the chosen box and nothing else. Same source as the Chat
+// page's picker: state.chat_models, which the server builds from what the
+// device says each model is. Benchmarking an embedding model produced a saved
+// run whose every section read "failed".
+function benchModelsFor(deviceId) {
+  return ((state && state.chat_models) ? state.chat_models : []).filter(
+    function (row) { return row.devices.indexOf(deviceId) !== -1; });
+}
+
+function fillBenchModels() {
+  var select = $('#bench-model');
+  var previous = select.value;
+  var note = $('#bench-note');
+  var deviceId = $('#bench-device').value;
+  var rows = benchModelsFor(deviceId);
+  select.textContent = '';
+  note.textContent = '';
+  if (!rows.length) {
+    select.appendChild(el('option', null, 'no chat model loaded'));
+    select.disabled = true;
+    $('#bench-run').disabled = true;
+    note.appendChild(document.createTextNode(
+      'Nothing that can be benchmarked is loaded on this device, because every '
+      + 'test here is a chat completion. Load a text generation model on the '));
+    var link = el('button', 'linklike', 'Models page');
+    link.type = 'button';
+    link.onclick = function () { show('models'); };
+    note.appendChild(link);
+    note.appendChild(document.createTextNode('.'));
+    return;
+  }
+  select.disabled = false;
+  $('#bench-run').disabled = benchBusy;
+  rows.forEach(function (row) {
+    var option = el('option', null, row.model_id);
+    option.value = row.model_id;
+    select.appendChild(option);
+  });
+  var ids = rows.map(function (row) { return row.model_id; });
+  select.value = ids.indexOf(previous) !== -1 ? previous : ids[0];
 }
 
 function loadBench() {
@@ -762,12 +812,17 @@ function paintBenchRun(run) {
   // Follow a live run, but leave a finished one at the top where its header
   // says which device and model produced the numbers.
   log.scrollTop = run.state === 'running' ? log.scrollHeight : 0;
+  if (run.state === 'running') {
+    benchBusy = true;
+    $('#bench-run').disabled = true;
+  }
   if (run.state === 'running' && !benchPoll) {
     benchPoll = setInterval(function () {
       api('/api/bench').then(function (payload) {
         if (!payload.current || payload.current.state !== 'running') {
           clearInterval(benchPoll);
           benchPoll = null;
+          benchBusy = false;
           paintBenchHistory(payload.history);
           $('#bench-run').disabled = false;
         }
@@ -804,6 +859,7 @@ function paintBenchHistory(history) {
 }
 
 function wireBench() {
+  $('#bench-device').onchange = fillBenchModels;
   $('#bench-run').onclick = function () {
     var device = $('#bench-device').value;
     if (!device) return toast('register a device first', true);
@@ -812,12 +868,20 @@ function wireBench() {
     for (var i = 0; i < boxes.length; i++) {
       if (boxes[i].checked) only.push(boxes[i].value);
     }
+    var model = $('#bench-model').disabled ? '' : $('#bench-model').value;
+    if (!model) return toast('no chat model is loaded on this device', true);
+    benchBusy = true;
     this.disabled = true;
     api('/api/bench', { method: 'POST',
-                        body: { device: device, label: $('#bench-label').value.trim() || 'run',
+                        body: { device: device, model: model,
+                                label: $('#bench-label').value.trim() || 'run',
                                 only: only } })
       .then(function (payload) { paintBenchRun(payload.current); })
-      .catch(function (err) { toast(err.message, true); $('#bench-run').disabled = false; });
+      .catch(function (err) {
+        benchBusy = false;
+        toast(err.message, true);
+        $('#bench-run').disabled = false;
+      });
   };
 }
 

@@ -474,3 +474,125 @@ class TestBenchPicksAChatModel(ServerCase):
         self.assertEqual(run.state, "error")
         self.assertIn("can chat", run.error)
         self.assertIn("Qwen/Qwen3-Embedding-0.6B", run.error)
+
+
+class TestBenchModelPicker(ServerCase):
+    """The Bench page had a device picker and no model picker.
+
+    It took whatever the device happened to have loaded first, so a box with an
+    embedding model at the front of its running list produced a saved run whose
+    every section read "failed" with the device's 400.
+    """
+
+    devices = 2
+
+    def offered_for(self, device_id):
+        """What the page's picker builds its list from, exactly as the JS does."""
+        _, payload = self.request("/api/state")
+        return [row["model_id"] for row in payload["chat_models"]
+                if device_id in row["devices"]]
+
+    def test_the_picker_lists_only_loaded_chat_models_on_that_device(self):
+        second = self.offered_for(self.fakes[1].serial)
+        self.assertEqual(second, ["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo"])
+        # That box has three models loaded; the other two cannot chat.
+        _, payload = self.request("/api/state")
+        running = [d["running"] for d in payload["devices"]
+                   if d["id"] == self.fakes[1].serial][0]
+        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", running)
+        self.assertIn("Qwen/Qwen3-Embedding-0.6B", running)
+        self.assertEqual(len(running), 3)
+
+    def test_the_list_is_per_device_not_fleet_wide(self):
+        first = self.offered_for(self.fakes[0].serial)
+        self.assertEqual(first, ["deepreinforce-ai/Ornith-1.0-35B"])
+        self.assertNotIn("Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", first,
+                         "loaded on the other box, not this one")
+
+    def test_a_device_with_nothing_chat_capable_offers_nothing(self):
+        self.fakes[0].state.loaded = ["Qwen/Qwen3-Embedding-0.6B"]
+        self.fleet.invalidate()
+        self.assertEqual(self.offered_for(self.fakes[0].serial), [])
+
+    def test_the_page_disables_run_and_says_why(self):
+        status, body = self.request("/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn("benchModelsFor", body)
+        self.assertIn("Nothing that can be benchmarked is loaded on this device", body)
+        self.assertIn("Models page", body)
+        status, body = self.request("/")
+        self.assertIn('id="bench-model"', body)
+
+
+class TestBenchRefusesWhatItCannotMeasure(ServerCase):
+    devices = 2
+
+    def test_an_embedding_model_is_refused_in_the_same_words_as_chat(self):
+        status, payload = self.request("/api/bench", "POST", {
+            "device": self.fakes[1].serial, "model": "Qwen/Qwen3-Embedding-0.6B",
+            "only": ["prefill"]})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertIn("is an embedding model and cannot chat",
+                      payload["error"]["message"])
+
+    def test_a_speech_model_is_refused(self):
+        status, payload = self.request("/api/bench", "POST", {
+            "device": self.fakes[1].serial,
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "only": ["prefill"]})
+        self.assertEqual(status, 400)
+        self.assertIn("is a text-to-speech model and cannot chat",
+                      payload["error"]["message"])
+
+    def test_a_refused_run_never_starts_and_never_saves(self):
+        before = len(bench_mod.history())
+        status, _ = self.request("/api/bench", "POST", {
+            "device": self.fakes[1].serial, "model": "Qwen/Qwen3-Embedding-0.6B",
+            "only": ["prefill"]})
+        self.assertEqual(status, 400)
+        self.assertIsNone(self.app.bench_run, "no run object was made")
+        time.sleep(0.4)
+        self.assertEqual(len(bench_mod.history()), before,
+                         "a run that cannot work must not leave a saved result")
+
+    def test_a_chat_model_on_the_wrong_device_is_refused(self):
+        status, payload = self.request("/api/bench", "POST", {
+            "device": self.fakes[0].serial,
+            "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", "only": ["prefill"]})
+        self.assertEqual(status, 400)
+        self.assertIn("is not loaded on", payload["error"]["message"])
+        self.assertIn(self.fakes[1].serial, payload["error"]["message"])
+
+    def test_an_unknown_model_is_refused(self):
+        status, payload = self.request("/api/bench", "POST", {
+            "device": self.fakes[0].serial, "model": "nobody/has-this"})
+        self.assertEqual(status, 400)
+        self.assertIn("no device in this fleet", payload["error"]["message"])
+
+    def test_the_chosen_model_is_the_one_benchmarked(self):
+        model = "Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo"
+        status, payload = self.request("/api/bench", "POST", {
+            "device": self.fakes[1].serial, "model": model, "label": "chosen",
+            "only": ["prefill"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["current"]["model"], model)
+        run = self.app.bench_run
+        for _ in range(200):
+            if run.state != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(run.record["model"], model)
+
+    def test_no_model_still_picks_the_first_chat_capable_one(self):
+        """The CLI and an older client send no model at all."""
+        status, payload = self.request("/api/bench", "POST", {
+            "device": self.fakes[1].serial, "label": "auto", "only": ["prefill"]})
+        self.assertEqual(status, 200)
+        run = self.app.bench_run
+        for _ in range(200):
+            if run.state != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(run.record["model"], "Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo")

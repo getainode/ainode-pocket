@@ -318,8 +318,16 @@ showing an empty picker.
 
 tiiny-bench, embedded. Prefill scaling against prompt length, sustained
 generation, concurrency, and what a reasoning model charges in wall time.
-Nothing is loaded, unloaded or deleted: it benchmarks whatever is already
+Nothing is loaded, unloaded or deleted: it benchmarks something already
 running, which is what makes it safe on a box doing real work.
+
+Pick the device and the model. The model list is the loaded models on that
+device that can chat, by the same rule the Chat page uses, because every
+section of this suite is a chat completion and an embedding model fails all of
+them. When nothing on a device can be benchmarked the Run button is disabled
+and the page says so. `POST /api/bench` refuses a model that cannot chat with
+the same 400 the endpoint gives, before a single section runs, so a run that
+could only fail never reaches the saved results.
 
 Requests take their turn through the device lock, so the concurrency rows
 measure queueing rather than collisions. The shape to look for is aggregate
@@ -431,6 +439,7 @@ These need a write, a second box, or a cable, so they were left alone:
 | 5 | Delete a loaded model | refused with 409, as the spec declares |
 | 6 | Chat against a model that supports chat | answers, and names the device that served it |
 | 6b | Chat against a loaded text-to-speech model | 400 before the device is touched, naming the loaded chat models |
+| 6c | Benchmark a loaded embedding model | 400 in the same words; no run starts and nothing is saved |
 | 7 | Eight concurrent callers (`--bench`, concurrency test) | all served, zero 150004, aggregate flat at about 24 tok/s |
 | 8 | Run OneLane against the same device while Pocket is busy | it waits rather than colliding |
 | 9 | Ask for a very long answer, non-streaming | 504 at about 220 s with the ceiling explained |

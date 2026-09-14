@@ -89,12 +89,16 @@ def _validate(body):
     return None
 
 
-def _refuse_non_chat(fleet, model_id):
-    """A 400 for a model this endpoint can never serve, or None.
+def refuse_non_chat(fleet, model_id):
+    """A 400 for a model that cannot chat, or None.
 
     Returned before routing, so nothing is asked of a device. A model Pocket
     has never heard of is not refused here: that is the router's 503, which can
     say which devices hold what.
+
+    Public because the benchmark needs the same answer in the same words. Every
+    section of that suite is a chat completion, so a model that cannot chat
+    cannot be benchmarked either, and two ways of saying so would drift.
     """
     slot = fleet.index().get(model_id)
     if slot is None or slot["chat"]:
@@ -124,7 +128,7 @@ def chat(fleet, body, timeout=240):
     if bad:
         return bad
     model_id = body["model"]
-    refusal = _refuse_non_chat(fleet, model_id)
+    refusal = refuse_non_chat(fleet, model_id)
     if refusal:
         return refusal
     try:
@@ -175,7 +179,7 @@ def chat_stream(fleet, body, timeout=600):
     if bad:
         return bad[0], bad[1], None
     model_id = body["model"]
-    refusal = _refuse_non_chat(fleet, model_id)
+    refusal = refuse_non_chat(fleet, model_id)
     if refusal:
         return refusal[0], refusal[1], None
     try:

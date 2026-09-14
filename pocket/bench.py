@@ -48,10 +48,13 @@ def results_dir():
 class Run:
     """One benchmark run, with a log the web UI can poll while it works."""
 
-    def __init__(self, device_id, label, only):
+    def __init__(self, device_id, label, only, model=None):
         self.device_id = device_id
         self.label = label
         self.only = only
+        # The model somebody chose, or None to take the first loaded one that
+        # can chat.
+        self.model = model
         self.started = time.time()
         self.finished = None
         self.state = "running"
@@ -67,6 +70,7 @@ class Run:
     def snapshot(self):
         with self._guard:
             return {"device": self.device_id, "label": self.label,
+                    "model": self.model,
                     "state": self.state, "error": self.error,
                     "started": self.started, "finished": self.finished,
                     "elapsed_s": round((self.finished or time.time()) - self.started, 1),
@@ -246,7 +250,22 @@ def execute(run, fleet):
         # the running list benchmarks that and reports numbers for a model that
         # never ran a token.
         chatty = _chat_capable(dev, running)
-        model = next((m for m in chatty), None)
+        if run.model:
+            model = run.model
+            if model not in running:
+                raise RuntimeError(
+                    "%s is not loaded on %s. The benchmark runs against what is "
+                    "already loaded and never loads anything itself; loaded "
+                    "there: %s." % (model, dev.name,
+                                    ", ".join(running) if running else "nothing"))
+            if model not in chatty:
+                raise RuntimeError(
+                    "%s cannot chat, and every section of this suite is a chat "
+                    "completion. Loaded on %s and able to chat: %s."
+                    % (model, dev.name,
+                       ", ".join(chatty) if chatty else "nothing"))
+        else:
+            model = next((m for m in chatty), None)
         if not model:
             if running:
                 raise RuntimeError(
@@ -257,6 +276,7 @@ def execute(run, fleet):
             raise RuntimeError("no model loaded on %s. Load one on the Models page "
                                "first; the benchmark never loads or unloads "
                                "anything itself." % dev.name)
+        run.model = model
         info = dev.device_info()
         units = dev.npu_units()
         telemetry = _telemetry(dev)
@@ -306,8 +326,8 @@ def _slug(text):
     return safe.strip("-")[:40] or "run"
 
 
-def start(fleet, device_id, label, only=None):
-    run = Run(device_id, label, only)
+def start(fleet, device_id, label, only=None, model=None):
+    run = Run(device_id, label, only, model)
     threading.Thread(target=execute, args=(run, fleet), daemon=True).start()
     return run
 

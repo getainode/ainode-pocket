@@ -434,6 +434,17 @@ class Handler(BaseHTTPRequestHandler):
         only = payload.get("only") or None
         if isinstance(only, str):
             only = [part.strip() for part in only.split(",") if part.strip()]
+        model = (payload.get("model") or "").strip() or None
+        # Every section of the suite is a chat completion, so a model that
+        # cannot chat fails all of them and saves a result full of 400s. Refuse
+        # in the same words the endpoint uses, before a single section runs.
+        if model:
+            refusal = gateway.refuse_non_chat(self.fleet, model)
+            if refusal:
+                return self.send_json(refusal[0], refusal[1])
+            bad = self.model_not_loaded_here(device_id, model)
+            if bad:
+                return self.send_json(400, bad)
         with self.app.guard:
             current = self.app.bench_run
             if current is not None and current.state == "running":
@@ -441,9 +452,34 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "a benchmark is already running"},
                     "current": current.snapshot()})
             run = bench_mod.start(self.fleet, device_id,
-                                  payload.get("label") or "run", only)
+                                  payload.get("label") or "run", only, model)
             self.app.bench_run = run
         return self.send_json(200, {"current": run.snapshot()})
+
+    def model_not_loaded_here(self, device_id, model):
+        """The benchmark runs on one named box, so the model has to be on it.
+
+        Nothing auto-loads on this hardware and the suite never loads anything,
+        so a model loaded on a different device is a mistake worth naming.
+        """
+        slot = self.fleet.index().get(model)
+        if slot is None:
+            return {"error": {"message": "no device in this fleet has a model "
+                                         "called %r" % model,
+                              "type": "invalid_request_error", "code": 400}}
+        if device_id in slot["loaded_on"]:
+            return None
+        try:
+            name = self.fleet.get(device_id).name
+        except NoDevice:
+            name = device_id
+        elsewhere = ", ".join(slot["loaded_on"])
+        return {"error": {
+            "message": "%s is not loaded on %s. The benchmark runs against what "
+                       "is already loaded and never loads anything itself.%s"
+                       % (model, name,
+                          (" It is loaded on %s." % elsewhere) if elsewhere else ""),
+            "type": "invalid_request_error", "code": 400}}
 
 
 class Server(ThreadingHTTPServer):
