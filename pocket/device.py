@@ -619,7 +619,7 @@ LINKS_TTL = 30.0
 def host_link_peers(force=False):
     """Peer addresses this host is currently plugged into, cached briefly.
 
-    Reading them shells out, and telemetry asks often, so the answer is held for
+    Reading them binds 32768 sockets, and telemetry asks often, so the answer is held for
     a few seconds. The cable moving is noticed within the TTL.
     """
     now = _now()
@@ -666,50 +666,31 @@ def peer_address(address, prefix):
 
 
 def _interface_addresses():
-    """(interface, ipv4, prefix length) for this host. Standard library only.
+    """(interface, ipv4, prefix length) for every USB link this host holds.
 
-    macOS and the BSDs answer with ifconfig and a hexadecimal netmask; Linux
-    answers with `ip -4 -o addr` and a prefix length. Anything else returns
-    nothing rather than guessing, and discovery falls back to the network scan.
+    Standard library only, and nothing is run: a Tiiny on the cable is a
+    point-to-point /30 inside 172.17/16, the box takes the first usable address
+    and this machine the second, so which links are attached is settled by
+    bind(), one call per usable address. bind() succeeds only on an address the
+    host really holds. All 32768 of them cost about four tenths of a second on a
+    laptop. The interface name is not knowable this way and is reported as
+    "usb"; nothing reads it for anything but display. The farm forbids shelling
+    out, which is why the ip and ifconfig readers this replaced are gone.
     """
-    import subprocess
     out = []
-    try:
-        text = subprocess.run(["ip", "-4", "-o", "addr", "show"],
-                              capture_output=True, text=True, timeout=6).stdout
-    except (OSError, subprocess.SubprocessError):
-        text = ""
-    if text.strip():
-        for line in text.splitlines():
-            fields = line.split()
-            if len(fields) < 4 or fields[2] != "inet":
-                continue
-            cidr = fields[3]
-            if "/" not in cidr:
-                continue
-            address, _, prefix = cidr.partition("/")
-            try:
-                out.append((fields[1], address, int(prefix)))
-            except ValueError:
-                continue
-        return out
-    try:
-        text = subprocess.run(["ifconfig"], capture_output=True, text=True,
-                              timeout=6).stdout
-    except (OSError, subprocess.SubprocessError):
-        return out
-    interface = None
-    for line in text.splitlines():
-        if line and not line[0].isspace():
-            interface = line.split(":")[0].strip()
-            continue
-        fields = line.split()
-        if len(fields) >= 4 and fields[0] == "inet" and "netmask" in fields:
-            address = fields[1]
-            mask = fields[fields.index("netmask") + 1]
-            prefix = _prefix_from_mask(mask)
-            if interface and prefix is not None:
-                out.append((interface, address, prefix))
+    for third in range(256):
+        for base in range(0, 256, 4):
+            for ours in (base + 2, base + 1):
+                address = "%s%d.%d" % (USB_NET_PREFIX, third, ours)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.bind((address, 0))
+                except OSError:
+                    continue
+                finally:
+                    sock.close()
+                out.append(("usb", address, 30))
+                break
     return out
 
 
