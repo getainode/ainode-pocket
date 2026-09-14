@@ -543,14 +543,14 @@ function download(modelId, cell, button) {
 }
 
 /* ── chat ────────────────────────────────────────────────────────── */
+// Only models that can chat AND are loaded somewhere. A device holds speech,
+// embedding, reranking and image models too, and the running list on its own
+// does not tell them apart, so the server works it out and sends the answer in
+// state.chat_models. Offering a text-to-speech model here is what produced the
+// device's own "does not support chat" error in the middle of a conversation.
 function readyModels() {
-  var out = [];
-  (state ? state.devices : []).forEach(function (device) {
-    (device.running || []).forEach(function (modelId) {
-      if (out.indexOf(modelId) === -1) out.push(modelId);
-    });
-  });
-  return out.sort();
+  return (state && state.chat_models ? state.chat_models : []).map(
+    function (row) { return row.model_id; });
 }
 
 function firstReadyModel() {
@@ -561,22 +561,43 @@ function firstReadyModel() {
 function fillChatModels() {
   var select = $('#chat-model');
   var previous = select.value;
-  var models = readyModels();
+  var rows = (state && state.chat_models) ? state.chat_models : [];
+  var note = $('#chat-route');
   select.textContent = '';
-  if (!models.length) {
-    select.appendChild(el('option', null, 'no loaded model'));
+  note.textContent = '';
+  if (!rows.length) {
+    select.appendChild(el('option', null, 'no chat model loaded'));
     select.disabled = true;
-    $('#chat-route').textContent = 'Load a model on the Models page first.';
+    note.appendChild(document.createTextNode(
+      'No chat model is loaded, so there is nothing here to talk to. Load one on the '));
+    var link = el('button', 'linklike', 'Models page');
+    link.type = 'button';
+    link.onclick = function () { show('models'); };
+    note.appendChild(link);
+    note.appendChild(document.createTextNode('.'));
     return;
   }
   select.disabled = false;
-  models.forEach(function (modelId) {
-    var option = el('option', null, modelId);
-    option.value = modelId;
-    select.appendChild(option);
+  // Grouped by where the model is loaded, because on a fleet the useful
+  // question is which box will answer. A model loaded on two devices gets its
+  // own group, since the endpoint chooses between them and the person does not.
+  var groups = [];
+  var byWhere = {};
+  rows.forEach(function (row) {
+    if (!byWhere[row.where]) {
+      byWhere[row.where] = el('optgroup');
+      byWhere[row.where].label = row.where;
+      groups.push(byWhere[row.where]);
+    }
+    var option = el('option', null, row.model_id);
+    option.value = row.model_id;
+    byWhere[row.where].appendChild(option);
   });
-  if (models.indexOf(previous) !== -1) select.value = previous;
-  $('#chat-route').textContent = 'routed to whichever device has it loaded';
+  groups.forEach(function (group) { select.appendChild(group); });
+  select.value = readyModels().indexOf(previous) !== -1 ? previous : rows[0].model_id;
+  note.textContent = rows.length === 1
+    ? 'routed to ' + rows[0].where
+    : 'routed to whichever device has it loaded';
 }
 
 function turn(who, cls) {
@@ -591,7 +612,9 @@ function turn(who, cls) {
 function send(text, maxTokens) {
   if (chatBusy) return;
   var model = $('#chat-model').value;
-  if (!model || $('#chat-model').disabled) return toast('no loaded model to ask', true);
+  if (!model || $('#chat-model').disabled) {
+    return toast('no chat model is loaded. Load one on the Models page.', true);
+  }
   var log = $('#chat-log');
   if (log.querySelector('.chat-empty')) log.textContent = '';
   var mine = turn('you', 'user');

@@ -73,7 +73,9 @@ a namespaced block a strict OpenAI client will ignore:
   "owned_by": "2 devices",
   "ainode_pocket": {
     "ready": true,
+    "chat": true,
     "type": "Image-Text-to-Text",
+    "capabilities": ["main"],
     "params": "35B",
     "devices": ["TNY...01Q", "TNY...03Q"],
     "loaded_on": ["TNY...01Q"]
@@ -84,10 +86,29 @@ a namespaced block a strict OpenAI client will ignore:
 `ready` means at least one device has it loaded and a request will be served now.
 `GET /v1/models?loaded=1` returns only those.
 
+`chat` is the other half of the question. A Tiiny holds text-to-speech, speech
+recognition, embedding, reranking, OCR, music and image models alongside the
+ones you can talk to, and every one of them is a model as far as this list is
+concerned. That is the OpenAI contract and the list keeps all of them, so
+`chat` is how you tell them apart: it is true for Text Generation and
+Image-Text-to-Text, and false for everything else. The device itself is the
+source, through the `capabilities` it reports per model, with the type as the
+fallback for a row that carries none.
+
 ### `POST /v1/chat/completions`
 
 Standard request body. Routing works like this:
 
+0. Refuse a model that cannot chat, with a 400, before any device is touched:
+
+   ```
+   Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice is a text-to-speech model and cannot
+   chat. Loaded chat models: Qwen/Qwen3-8B.
+   ```
+
+   Sent on to the device, that request comes back as the device's own
+   "does not support chat" error, which reads like a broken app rather than a
+   wrong choice.
 1. Find the devices that have this model **loaded**. Not installed: loaded.
    Models do not auto-load on this hardware and a 35B takes tens of seconds to
    come up, so Pocket will not start one behind your back to serve a chat.
@@ -284,6 +305,13 @@ header of a reply says which device answered it. A reasoning model's chain of
 thought is shown separately from the answer, because it is spending the same
 `max_tokens` budget the answer needs.
 
+The picker lists only models that can chat and are loaded right now, grouped by
+the device holding them, and it defaults to the first of those. A box commonly
+has an embedding model and a speech model loaded next to one chat model, and
+offering those is offering a conversation that cannot happen. When nothing that
+can chat is loaded, the page says so and points at the Models page rather than
+showing an empty picker.
+
 ![Chat](docs/screenshots/chat.png)
 
 ### Bench
@@ -402,6 +430,7 @@ These need a write, a second box, or a cable, so they were left alone:
 | 4 | Download from the catalog | progress advances and the SSE stream ends at 100 |
 | 5 | Delete a loaded model | refused with 409, as the spec declares |
 | 6 | Chat against a model that supports chat | answers, and names the device that served it |
+| 6b | Chat against a loaded text-to-speech model | 400 before the device is touched, naming the loaded chat models |
 | 7 | Eight concurrent callers (`--bench`, concurrency test) | all served, zero 150004, aggregate flat at about 24 tok/s |
 | 8 | Run OneLane against the same device while Pocket is busy | it waits rather than colliding |
 | 9 | Ask for a very long answer, non-streaming | 504 at about 220 s with the ceiling explained |

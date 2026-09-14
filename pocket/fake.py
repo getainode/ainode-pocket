@@ -90,33 +90,58 @@ MIN_SLEEP = 0.05
 # Pause between download progress frames in demo mode, so the bar can be seen.
 DEMO_DOWNLOAD_STEP = 0.4
 
-# Unit costs are the measured ones from CAPABILITIES.md.
+# Unit costs are the measured ones from CAPABILITIES.md. The capabilities list
+# is the device's own answer about what a model is for, read off live firmware
+# on 2026-09-14: "main" is the chat runtime and every other value is a model
+# that will never answer a chat completion.
 CATALOG = [
     {"model_id": "deepreinforce-ai/Ornith-1.0-35B", "type": "Image-Text-to-Text",
-     "params": "35B", "size": 18_000_000_000, "npu_usage": 50},
+     "params": "35B", "size": 18_000_000_000, "npu_usage": 50,
+     "capabilities": ["main"]},
     {"model_id": "Qwen/Qwen3.6-35B-A3B", "type": "Image-Text-to-Text",
-     "params": "35B-A3B", "size": 18_000_000_000, "npu_usage": 50},
+     "params": "35B-A3B", "size": 18_000_000_000, "npu_usage": 50,
+     "capabilities": ["main"]},
     {"model_id": "Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", "type": "Text Generation",
-     "params": "30B-A3B", "size": 15_200_000_000, "npu_usage": 45},
+     "params": "30B-A3B", "size": 15_200_000_000, "npu_usage": 45,
+     "capabilities": ["main"]},
     {"model_id": "Tongyi-MAI/Z-Image-Turbo", "type": "Text-to-Image",
-     "params": "6B", "size": 10_200_000_000, "npu_usage": 32},
+     "params": "6B", "size": 10_200_000_000, "npu_usage": 32,
+     "capabilities": ["image"]},
     {"model_id": "Qwen/Qwen3-ASR-1.7B", "type": "ASR",
-     "params": "1.7B", "size": 3_600_000_000, "npu_usage": 7},
+     "params": "1.7B", "size": 3_600_000_000, "npu_usage": 7,
+     "capabilities": ["audio"]},
+    {"model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "type": "Text-to-Speech",
+     "params": "1.7B", "size": 2_400_000_000, "npu_usage": 7,
+     "capabilities": ["voice"]},
     {"model_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "type": "Text-to-Speech",
-     "params": "1.7B", "size": 2_500_000_000, "npu_usage": 5},
+     "params": "1.7B", "size": 2_500_000_000, "npu_usage": 5,
+     "capabilities": ["voice"]},
     {"model_id": "Qwen/Qwen3-Reranker-0.6B", "type": "Text Reranking",
-     "params": "0.6B", "size": 700_000_000, "npu_usage": 2},
+     "params": "0.6B", "size": 700_000_000, "npu_usage": 2,
+     "capabilities": ["rerank"]},
     {"model_id": "Qwen/Qwen3-Embedding-0.6B", "type": "Text Embedding",
-     "params": "0.6B", "size": 900_000_000, "npu_usage": 1},
+     "params": "0.6B", "size": 900_000_000, "npu_usage": 1,
+     "capabilities": ["embedding"]},
     {"model_id": "openai/gpt-oss-20b", "type": "Text Generation",
-     "params": "20B", "size": 12_000_000_000, "npu_usage": 30},
+     "params": "20B", "size": 12_000_000_000, "npu_usage": 30,
+     "capabilities": ["main"]},
     {"model_id": "zai-org/GLM-4.7-Flash", "type": "Text Generation",
-     "params": "9B", "size": 6_000_000_000, "npu_usage": 12},
+     "params": "9B", "size": 6_000_000_000, "npu_usage": 12,
+     "capabilities": ["main"]},
+    # No capabilities at all, on purpose: older catalogue rows carry only a
+    # type, and the classifier has to fall back to it rather than refuse.
+    {"model_id": "PaddlePaddle/PP-OCRv6-Small", "type": "Image-to-Text",
+     "params": "2.48M", "size": 114_000_000, "npu_usage": 0},
 ]
 
+# A device that has a speech model loaded next to a chat model is the ordinary
+# case, not an exotic one: the box this was checked against had an embedding,
+# an image and a text-to-speech model running alongside one chat model.
 DEFAULT_INSTALLED = ["deepreinforce-ai/Ornith-1.0-35B",
                      "Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo",
-                     "Qwen/Qwen3-Embedding-0.6B"]
+                     "Qwen/Qwen3-Embedding-0.6B",
+                     "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                     "Qwen/Qwen3-ASR-1.7B"]
 
 # Filler for the fake's answers. Long and varied enough that a few hundred
 # tokens of it reads like prose rather than one sentence on a loop, which
@@ -184,7 +209,7 @@ class FakeState:
             if row["model_id"] == model_id:
                 return row
         return {"model_id": model_id, "type": "Text Generation", "params": "?",
-                "size": 0, "npu_usage": 1}
+                "size": 0, "npu_usage": 1, "capabilities": ["main"]}
 
     def units_used(self):
         return sum(self._cost(m) for m in self.loaded)
@@ -200,6 +225,7 @@ class FakeState:
                 "name": short, "fullname": model_id, "size": row["size"],
                 "toolkit_size": 0, "runtime_size": 0, "total_size": row["size"],
                 "params": row["params"], "type": row["type"], "id": model_id,
+                "capabilities": list(row.get("capabilities") or []),
                 "model_id": model_id, "display_name": short,
                 "hf_repo_id": model_id, "object": "model", "created": 0,
                 "owned_by": "Model store", "status": "downloaded",
@@ -213,8 +239,11 @@ class FakeState:
             # All four verified against live firmware 2026-09-13. The real
             # payload carries more per instance (created_at, capabilities,
             # active_request_count); these are the ones Pocket reads.
+            row = self._row(model_id)
             instances.append({"model_id": model_id, "port": 9098 + offset,
                               "npu_usage": self._cost(model_id),
+                              "type": row["type"],
+                              "capabilities": list(row.get("capabilities") or []),
                               "instance_id": "fake-%s-%d" % (self.serial, offset)})
         return {"running": list(self.loaded), "instances": {"running": instances}}
 
@@ -308,6 +337,7 @@ class FakeState:
                         "display_name": short, "type": row["type"],
                         "params": row["params"], "size": row["size"],
                         "npu_usage": row["npu_usage"],
+                        "capabilities": list(row.get("capabilities") or []),
                         "status": "downloaded" if row["model_id"] in self.installed
                                   else "not_downloaded"})
         return out
@@ -938,11 +968,17 @@ def fleet_of(count, planes_for_first=None, **kwargs):
     is what a real Tiiny looks like when it is plugged in over USB and joined to
     Wi-Fi at the same time.
     """
+    # The second box carries the mix a real device ends up with: a chat model
+    # loaded next to an embedding and a text-to-speech model, none of which can
+    # answer a chat completion. The third has only a non-chat model loaded,
+    # which is the case where the Chat picker must offer nothing rather than
+    # offer an image generator.
     spreads = [
         (DEFAULT_INSTALLED, ["deepreinforce-ai/Ornith-1.0-35B"]),
         (["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", "Qwen/Qwen3-Embedding-0.6B",
-          "zai-org/GLM-4.7-Flash"],
-         ["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", "Qwen/Qwen3-Embedding-0.6B"]),
+          "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "zai-org/GLM-4.7-Flash"],
+         ["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", "Qwen/Qwen3-Embedding-0.6B",
+          "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"]),
         (["deepreinforce-ai/Ornith-1.0-35B", "Tongyi-MAI/Z-Image-Turbo"],
          ["Tongyi-MAI/Z-Image-Turbo"]),
     ]

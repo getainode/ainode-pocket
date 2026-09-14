@@ -201,3 +201,141 @@ class TestStreaming(FakeFleetCase):
         self.assertTrue(lock.busy)
         list(iterator)
         self.assertFalse(lock.busy)
+
+
+class TestModelKinds(FakeFleetCase):
+    """A Tiiny holds speech, embedding and image models next to the chat ones.
+
+    The device answers a chat completion aimed at one of them with its own
+    "does not support chat" error, which reads as a broken app rather than a
+    wrong choice, so the endpoint refuses first and says what the model is.
+    """
+
+    devices = 2
+
+    def test_the_device_tells_us_what_each_model_is(self):
+        rows = {row["model_id"]: row for row in self.fleet.models(self.fakes[1].serial)}
+        tts = rows["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"]
+        self.assertEqual(tts["type"], "Text-to-Speech")
+        self.assertEqual(tts["capabilities"], ["voice"])
+        self.assertFalse(tts["chat"])
+        self.assertTrue(tts["loaded"], "the fixture has it loaded, as a real box does")
+        coder = rows["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo"]
+        self.assertEqual(coder["capabilities"], ["main"])
+        self.assertTrue(coder["chat"])
+
+    def test_a_capabilityless_row_falls_back_to_its_type(self):
+        """Older catalogue rows carry a type and no capabilities at all."""
+        self.fakes[0].state.installed.append("PaddlePaddle/PP-OCRv6-Small")
+        self.fleet.invalidate()
+        rows = {row["model_id"]: row for row in self.fleet.models(self.fakes[0].serial,
+                                                                 force=True)}
+        ocr = rows["PaddlePaddle/PP-OCRv6-Small"]
+        self.assertEqual(ocr["capabilities"], [])
+        self.assertFalse(ocr["chat"])
+
+    def test_every_model_is_still_listed_with_a_chat_flag(self):
+        """/v1/models stays the full list. That is the OpenAI contract, and a
+        client that filters on nothing must still see everything installed."""
+        rows = {row["id"]: row for row in gateway.models_payload(self.fleet)["data"]}
+        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", rows)
+        self.assertIn("Qwen/Qwen3-Embedding-0.6B", rows)
+        self.assertFalse(rows["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"]
+                         ["ainode_pocket"]["chat"])
+        self.assertFalse(rows["Qwen/Qwen3-Embedding-0.6B"]["ainode_pocket"]["chat"])
+        self.assertTrue(rows["deepreinforce-ai/Ornith-1.0-35B"]["ainode_pocket"]["chat"])
+        self.assertTrue(rows["Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo"]
+                        ["ainode_pocket"]["chat"])
+        # A vision model is a chat model: it answers /v1/chat/completions.
+        self.assertEqual(rows["deepreinforce-ai/Ornith-1.0-35B"]
+                         ["ainode_pocket"]["capabilities"], ["main"])
+
+    def test_chat_with_a_speech_model_is_a_400_that_names_the_alternatives(self):
+        status, payload = gateway.chat(self.fleet, {
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "max_tokens": 24,
+            "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        message = payload["error"]["message"]
+        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice is a text-to-speech "
+                      "model and cannot chat.", message)
+        self.assertIn("Loaded chat models:", message)
+        self.assertIn("Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", message)
+        self.assertIn("deepreinforce-ai/Ornith-1.0-35B", message)
+        self.assertNotIn("Qwen/Qwen3-Embedding-0.6B", message.split("Loaded chat models:")[1])
+
+    def test_the_refusal_never_reaches_the_device(self):
+        """A 400 the endpoint decides itself, not a device error dressed up."""
+        before = self.fakes[1].state.served
+        status, _ = gateway.chat(self.fleet, {
+            "model": "Qwen/Qwen3-Embedding-0.6B", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.fakes[1].state.served, before,
+                         "nothing was asked of the device")
+
+    def test_an_embedding_model_is_refused_by_what_it_is(self):
+        status, payload = gateway.chat(self.fleet, {
+            "model": "Qwen/Qwen3-Embedding-0.6B",
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 400)
+        self.assertIn("is an embedding model and cannot chat",
+                      payload["error"]["message"])
+
+    def test_an_installed_but_unloaded_non_chat_model_is_still_a_400(self):
+        """Type beats load state: loading it would not make it able to chat."""
+        status, payload = gateway.chat(self.fleet, {
+            "model": "Qwen/Qwen3-ASR-1.7B",
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 400)
+        self.assertIn("is a speech recognition model and cannot chat",
+                      payload["error"]["message"])
+
+    def test_a_streaming_request_is_refused_the_same_way(self):
+        status, payload, stream = gateway.chat_stream(self.fleet, {
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 400)
+        self.assertIsNone(stream, "refused before a single byte goes out")
+        self.assertIn("cannot chat", payload["error"]["message"])
+
+    def test_an_unknown_model_is_still_the_router_503(self):
+        """Not a 400: Pocket cannot say what a model it has never seen is."""
+        status, payload = gateway.chat(self.fleet, {
+            "model": "nobody/has-this",
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 503)
+
+    def test_a_chat_model_still_answers(self):
+        status, payload = gateway.chat(self.fleet, {
+            "model": "deepreinforce-ai/Ornith-1.0-35B", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["choices"][0]["message"]["content"])
+
+
+class TestNothingLoadedToChatWith(FakeFleetCase):
+    """One box with only an image model loaded: the third fixture spread."""
+
+    devices = 3
+
+    def setUp(self):
+        super().setUp()
+        for fake in self.fakes[:2]:
+            fake.state.loaded = []
+        self.fleet.invalidate()
+
+    def test_the_refusal_says_so_instead_of_listing_nothing(self):
+        status, payload = gateway.chat(self.fleet, {
+            "model": "Tongyi-MAI/Z-Image-Turbo",
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 400)
+        message = payload["error"]["message"]
+        self.assertIn("is an image generation model and cannot chat", message)
+        self.assertIn("No chat model is loaded right now", message)
+        self.assertIn("Models page", message)
+
+    def test_the_fleet_reports_no_loaded_chat_model(self):
+        self.assertEqual(self.fleet.chat_models(), [])
+        self.assertTrue(self.fleet.chat_models(loaded_only=False),
+                        "installed chat models are still known")

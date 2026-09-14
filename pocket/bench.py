@@ -211,14 +211,49 @@ TESTS = {"prefill": t_prefill, "sustained": t_sustained,
          "concurrency": t_concurrency, "thinking": t_thinking}
 
 
+def _chat_capable(dev, running):
+    """Filter a device's running list down to the models that can chat.
+
+    Keeps the device's own order, so a box with one chat model loaded gets that
+    one and a box with several still gets the first. The model list is asked
+    for once; if the device will not answer it, nothing is filtered out rather
+    than the benchmark refusing to run at all.
+    """
+    try:
+        rows = dev.models()
+    except device_mod.DeviceError:
+        return list(running)
+    kinds = {}
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("model_id") or entry.get("id") or entry.get("name")
+        if model_id:
+            kinds[model_id] = device_mod.can_chat(
+                entry.get("type"), device_mod.capability_list(entry))
+    return [m for m in running if kinds.get(m, True)]
+
+
 def execute(run, fleet):
     """Run the suite. Called on a worker thread by start()."""
     try:
         dev = fleet.get(run.device_id)
         lock = fleet.locks[run.device_id]
         running = list((dev.running().get("running") or []))
-        model = next((m for m in running), None)
+        # Every test in this suite is a chat completion, so the model has to be
+        # one that answers a chat completion. A box commonly has an embedding or
+        # a speech model loaded first, and taking whatever is at the front of
+        # the running list benchmarks that and reports numbers for a model that
+        # never ran a token.
+        chatty = _chat_capable(dev, running)
+        model = next((m for m in chatty), None)
         if not model:
+            if running:
+                raise RuntimeError(
+                    "nothing loaded on %s can chat: %s. The benchmark measures "
+                    "chat completions, so load a text generation model on the "
+                    "Models page first; it never loads or unloads anything "
+                    "itself." % (dev.name, ", ".join(running)))
             raise RuntimeError("no model loaded on %s. Load one on the Models page "
                                "first; the benchmark never loads or unloads "
                                "anything itself." % dev.name)

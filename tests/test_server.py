@@ -342,3 +342,135 @@ class TestBenchApi(ServerCase):
     def test_a_bad_result_name_is_refused(self):
         status, _ = self.request("/api/bench/result?name=../../etc/passwd")
         self.assertEqual(status, 404)
+
+
+class TestChatPicker(ServerCase):
+    """What the Chat page is allowed to put in its model picker.
+
+    The page used to build the picker from each device's running list, which is
+    every loaded model of every kind, so a loaded text-to-speech model was
+    offered and answered "does not support chat" when somebody used it. The
+    server decides now and the page renders what it is told.
+    """
+
+    devices = 2
+
+    def test_the_state_offers_only_loaded_chat_models(self):
+        status, payload = self.request("/api/state")
+        self.assertEqual(status, 200)
+        offered = [row["model_id"] for row in payload["chat_models"]]
+        self.assertIn("deepreinforce-ai/Ornith-1.0-35B", offered)
+        self.assertIn("Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", offered)
+        self.assertNotIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", offered)
+        self.assertNotIn("Qwen/Qwen3-Embedding-0.6B", offered)
+        # Both of those are genuinely loaded, which is the whole point.
+        running = []
+        for device in payload["devices"]:
+            running.extend(device["running"])
+        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", running)
+        self.assertIn("Qwen/Qwen3-Embedding-0.6B", running)
+
+    def test_an_installed_chat_model_that_is_not_loaded_is_not_offered(self):
+        status, payload = self.request("/api/state")
+        offered = [row["model_id"] for row in payload["chat_models"]]
+        self.assertNotIn("zai-org/GLM-4.7-Flash", offered,
+                         "installed on fake 2, loaded nowhere, and nothing "
+                         "auto-loads on this hardware")
+
+    def test_each_offer_says_where_it_is_loaded(self):
+        status, payload = self.request("/api/state")
+        rows = {row["model_id"]: row for row in payload["chat_models"]}
+        ornith = rows["deepreinforce-ai/Ornith-1.0-35B"]
+        self.assertEqual(ornith["devices"], [self.fakes[0].serial])
+        self.assertEqual(ornith["where"], self.fakes[0].name)
+        self.assertEqual(ornith["type"], "Image-Text-to-Text")
+
+    def test_a_model_loaded_on_two_devices_is_offered_once(self):
+        model = "deepreinforce-ai/Ornith-1.0-35B"
+        self.fakes[1].state.installed.append(model)
+        self.fakes[1].state.loaded = [model]
+        self.fleet.invalidate()
+        status, payload = self.request("/api/state")
+        rows = [row for row in payload["chat_models"] if row["model_id"] == model]
+        self.assertEqual(len(rows), 1, "the endpoint routes on the model id alone")
+        self.assertEqual(rows[0]["where"], "2 devices")
+
+    def test_nothing_is_offered_when_no_chat_model_is_loaded(self):
+        for fake in self.fakes:
+            fake.state.loaded = ["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+                                 if "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+                                 in fake.state.installed else
+                                 "Qwen/Qwen3-Embedding-0.6B"]
+        self.fleet.invalidate()
+        status, payload = self.request("/api/state")
+        self.assertEqual(payload["chat_models"], [])
+        self.assertEqual(payload["summary"]["chat_ready"], 0)
+        self.assertTrue(payload["summary"]["loaded"], "things are loaded, just not chat models")
+
+    def test_the_page_tells_somebody_what_to_do_when_nothing_is_loaded(self):
+        status, body = self.request("/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn("No chat model is loaded", body)
+        self.assertIn("Models page", body)
+        # And it no longer derives the picker from the raw running list.
+        self.assertIn("state.chat_models", body)
+        self.assertNotIn("(device.running || []).forEach(function (modelId) {\n"
+                         "      if (out.indexOf(modelId) === -1)", body)
+
+
+class TestEndpointRefusesNonChatModels(ServerCase):
+    devices = 2
+
+    def test_the_http_endpoint_answers_400_not_a_device_error(self):
+        status, payload = self.request("/v1/chat/completions", "POST", {
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertIn("is a text-to-speech model and cannot chat",
+                      payload["error"]["message"])
+        self.assertIn("Loaded chat models:", payload["error"]["message"])
+
+    def test_v1_models_still_lists_everything_with_a_chat_flag(self):
+        status, payload = self.request("/v1/models")
+        self.assertEqual(status, 200)
+        rows = {row["id"]: row for row in payload["data"]}
+        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", rows)
+        self.assertIs(rows["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"]
+                      ["ainode_pocket"]["chat"], False)
+        self.assertIs(rows["deepreinforce-ai/Ornith-1.0-35B"]
+                      ["ainode_pocket"]["chat"], True)
+
+
+class TestBenchPicksAChatModel(ServerCase):
+    """Every test in the suite is a chat completion, so the model has to chat.
+
+    A box commonly has an embedding or a speech model at the front of its
+    running list, and the benchmark used to take whatever was first.
+    """
+
+    def test_the_speech_model_at_the_front_of_the_list_is_skipped(self):
+        self.fake.state.installed.append("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        self.fake.state.loaded = ["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                                  "deepreinforce-ai/Ornith-1.0-35B"]
+        self.fleet.invalidate()
+        run = bench_mod.start(self.fleet, self.fake.serial, "kinds", ["prefill"])
+        for _ in range(200):
+            if run.state != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(run.record["model"], "deepreinforce-ai/Ornith-1.0-35B")
+        self.assertIn("model  : deepreinforce-ai/Ornith-1.0-35B", run.lines)
+
+    def test_only_non_chat_models_loaded_is_a_clear_refusal(self):
+        self.fake.state.loaded = ["Qwen/Qwen3-Embedding-0.6B"]
+        self.fleet.invalidate()
+        run = bench_mod.start(self.fleet, self.fake.serial, "kinds", ["prefill"])
+        for _ in range(200):
+            if run.state != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(run.state, "error")
+        self.assertIn("can chat", run.error)
+        self.assertIn("Qwen/Qwen3-Embedding-0.6B", run.error)

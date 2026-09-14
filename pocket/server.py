@@ -19,7 +19,7 @@ from . import device as device_mod
 from . import gateway
 from .fleet import Fleet, NoDevice
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 PORT = 8430
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -220,14 +220,42 @@ class Handler(BaseHTTPRequestHandler):
         endpoint_host = self.headers.get("Host") or ("127.0.0.1:%d" % PORT)
         return {"version": VERSION,
                 "devices": devices,
+                # What the Chat page is allowed to offer. A device holds speech,
+                # embedding and image models too and the page must not put one
+                # in the picker, so the answer is computed here rather than
+                # guessed from the running list in the browser.
+                "chat_models": self.chat_models(index),
                 "summary": {"devices": len(devices),
                             "online": sum(1 for d in devices if d.get("online")),
                             "models": len(index),
                             "models_ready": ready,
+                            "chat_ready": sum(1 for slot in index.values()
+                                              if slot["chat"] and slot["loaded_on"]),
                             "loaded": sum(len(d.get("running") or []) for d in devices)},
                 "endpoint": {"base_url": "http://%s/v1" % endpoint_host,
                              "models": "http://%s/v1/models" % endpoint_host},
                 "fake": [{"name": f.name, "base": f.base} for f in self.app.fakes]}
+
+    def chat_models(self, index):
+        """Loaded chat models, each labelled with where it is loaded.
+
+        The endpoint routes on the model id alone, so this is one row per model
+        and not one per copy: naming two devices on a model loaded on both would
+        suggest a choice the caller does not get to make.
+        """
+        rows = []
+        for model_id in sorted(index):
+            slot = index[model_id]
+            if not slot["chat"] or not slot["loaded_on"]:
+                continue
+            names = [self.fleet.devices[d].name for d in slot["loaded_on"]
+                     if d in self.fleet.devices]
+            rows.append({"model_id": model_id,
+                         "type": slot["type"],
+                         "devices": slot["loaded_on"],
+                         "where": names[0] if len(names) == 1
+                                  else "%d devices" % len(names)})
+        return rows
 
     def download_events(self):
         """Proxy the device's download SSE straight through to the browser."""

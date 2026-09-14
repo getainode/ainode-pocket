@@ -5,6 +5,11 @@
 
 The contract is deliberately small and honest:
 
+  * A model that cannot chat is refused here, with a 400, before any device is
+    touched. A Tiiny holds speech, embedding and image models alongside the
+    chat ones and will happily be asked to chat with a text-to-speech model;
+    what comes back is a device error about an unsupported model, which reads
+    like a broken app rather than a wrong choice.
   * A request is routed to a device that already has the model loaded. Models do
     not auto-load on this hardware and Pocket does not load one behind your back
     to serve a chat, because a 35B takes tens of seconds to come up and a silent
@@ -59,7 +64,12 @@ def models_payload(fleet, loaded_only=False):
             # Namespaced so a strict OpenAI client ignores it and the UI can use it.
             "ainode_pocket": {
                 "ready": ready,
+                # Every model stays in the list, because that is what the
+                # OpenAI contract says /v1/models is. Whether this endpoint can
+                # chat with it is a separate question, answered here.
+                "chat": slot["chat"],
                 "type": slot["type"],
+                "capabilities": slot["capabilities"],
                 "params": slot["params"],
                 "size": slot["size"],
                 "devices": slot["devices"],
@@ -79,6 +89,28 @@ def _validate(body):
     return None
 
 
+def _refuse_non_chat(fleet, model_id):
+    """A 400 for a model this endpoint can never serve, or None.
+
+    Returned before routing, so nothing is asked of a device. A model Pocket
+    has never heard of is not refused here: that is the router's 503, which can
+    say which devices hold what.
+    """
+    slot = fleet.index().get(model_id)
+    if slot is None or slot["chat"]:
+        return None
+    phrase = device_mod.type_phrase(slot["type"])
+    head = ("%s is %s and cannot chat." % (model_id, phrase) if phrase
+            else "%s is not a chat model." % model_id)
+    loaded = fleet.chat_models()
+    if loaded:
+        tail = "Loaded chat models: %s." % ", ".join(loaded)
+    else:
+        tail = ("No chat model is loaded right now. Load one on the Models "
+                "page first.")
+    return error(400, "%s %s" % (head, tail), "invalid_request_error")
+
+
 def _pick(fleet, model_id):
     try:
         return fleet.route(model_id)
@@ -92,6 +124,9 @@ def chat(fleet, body, timeout=240):
     if bad:
         return bad
     model_id = body["model"]
+    refusal = _refuse_non_chat(fleet, model_id)
+    if refusal:
+        return refusal
     try:
         dev, lock = fleet.route(model_id)
     except NoDevice as exc:
@@ -140,6 +175,9 @@ def chat_stream(fleet, body, timeout=600):
     if bad:
         return bad[0], bad[1], None
     model_id = body["model"]
+    refusal = _refuse_non_chat(fleet, model_id)
+    if refusal:
+        return refusal[0], refusal[1], None
     try:
         dev, lock = fleet.route(model_id)
     except NoDevice as exc:

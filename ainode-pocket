@@ -286,10 +286,26 @@ def cmd_selfcheck(args):
         check("device telemetry", status == 200 and state["devices"][0]["online"] is True,
               str(state.get("devices")))
         status, models = get("/v1/models")
-        ready = [row for row in models.get("data", []) if row["ainode_pocket"]["ready"]]
+        rows = models.get("data", [])
+        ready = [row for row in rows
+                 if row["ainode_pocket"]["ready"] and row["ainode_pocket"]["chat"]]
         check("/v1/models union", status == 200 and bool(ready))
+        # Every model stays in the list; the chat flag is what tells them apart.
+        speech = [row for row in rows if not row["ainode_pocket"]["chat"]]
+        check("/v1/models marks what cannot chat", bool(speech))
+        check("chat models offered", status == 200
+              and bool(state.get("chat_models"))
+              and all(row["model_id"] in [r["id"] for r in ready]
+                      for row in state.get("chat_models", [])))
         check("web assets present", os.path.isfile(os.path.join(server_mod.WEB_DIR,
                                                                "index.html")))
+        if speech:
+            status, refusal = post("/v1/chat/completions", {
+                "model": speech[0]["id"], "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]})
+            check("400 refuses a model that cannot chat",
+                  status == 400 and "cannot chat" in refusal["error"]["message"],
+                  json.dumps(refusal)[:200])
         if ready:
             status, reply = post("/v1/chat/completions", {
                 "model": ready[0]["id"], "max_tokens": 24,

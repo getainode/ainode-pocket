@@ -163,6 +163,69 @@ def enc(model_id):
     return urllib.parse.quote(str(model_id), safe="")
 
 
+# --------------------------------------------------------------- model kinds
+# A Tiiny runs several kinds of model at once and only some of them answer a
+# chat completion. The device says which in two fields, and on firmware checked
+# 2026-09-14 they agree: `capabilities` carries "main" for exactly the models
+# the chat runtime serves, and `type` is the label the model store shows. The
+# capabilities list is the one to trust, because it is the runtime's own answer
+# about itself; the type is the fallback for a row that carries no capabilities
+# at all, which is what older catalogue entries look like.
+#
+# Measured on a live device: Text Generation and Image-Text-to-Text both carry
+# ["main"]; Text-to-Speech carries ["voice"], ASR ["audio"], Text Embedding
+# ["embedding"], Text Reranking ["rerank"], Text-to-Image ["image"],
+# Image-to-Text ["ocr"], and Music Generation ["music"].
+CHAT_CAPABILITY = "main"
+CHAT_TYPES = frozenset(["text generation", "image-text-to-text"])
+
+# Plain English for a refusal, so the message says what the model is instead of
+# echoing a label out of a catalogue at somebody.
+TYPE_PHRASES = {
+    "text-to-speech": "a text-to-speech model",
+    "asr": "a speech recognition model",
+    "text embedding": "an embedding model",
+    "text reranking": "a reranking model",
+    "text-to-image": "an image generation model",
+    "image-to-text": "an OCR model",
+    "music generation": "a music generation model",
+}
+
+
+def capability_list(entry):
+    """The capabilities a model row claims, lowercased, or an empty list."""
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("capabilities")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item).strip().lower() for item in raw if str(item).strip()]
+
+
+def can_chat(type_label=None, capabilities=None):
+    """Whether /v1/chat/completions can serve this model.
+
+    Capabilities win when the device sent any. An empty list is not an answer,
+    so it falls through to the type rather than refusing everything on firmware
+    that omits the field.
+    """
+    if capabilities:
+        return CHAT_CAPABILITY in [str(item).strip().lower() for item in capabilities]
+    return str(type_label or "").strip().lower() in CHAT_TYPES
+
+
+def type_phrase(type_label):
+    """"a text-to-speech model" for a type Pocket has a phrase for, else "".
+
+    An empty answer is deliberate: the caller says "is not a chat model" rather
+    than inventing a description of a type nobody has seen yet.
+    """
+    label = str(type_label or "").strip()
+    if not label:
+        return ""
+    return TYPE_PHRASES.get(label.lower(), "")
+
+
 def _read_error(payload):
     """Return (code, message) if this JSON body is a device error, else None.
 

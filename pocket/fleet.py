@@ -570,6 +570,7 @@ class Fleet:
             model_id = entry.get("model_id") or entry.get("id") or entry.get("name")
             if not model_id:
                 continue
+            capabilities = device_mod.capability_list(entry)
             out.append({"model_id": model_id,
                         "name": entry.get("display_name") or entry.get("name") or model_id,
                         "type": entry.get("type") or "",
@@ -577,6 +578,12 @@ class Fleet:
                         "size": entry.get("size") or entry.get("total_size") or 0,
                         "npu_usage": entry.get("npu_usage") or 0,
                         "status": entry.get("status") or "",
+                        "capabilities": capabilities,
+                        # A device holds speech, embedding and image models too,
+                        # and none of them answer a chat completion. Carrying
+                        # the answer on every row is what keeps the Chat picker
+                        # and the endpoint from offering one.
+                        "chat": device_mod.can_chat(entry.get("type"), capabilities),
                         "loaded": model_id in running})
         out.sort(key=lambda row: (row["type"], row["model_id"]))
         return out
@@ -598,13 +605,28 @@ class Fleet:
                 slot = union.setdefault(row["model_id"], {
                     "model_id": row["model_id"], "type": row["type"],
                     "params": row["params"], "size": row["size"],
+                    "capabilities": row["capabilities"], "chat": row["chat"],
                     "devices": [], "loaded_on": []})
                 slot["devices"].append(device_id)
                 if row["loaded"]:
                     slot["loaded_on"].append(device_id)
                 if not slot["type"]:
                     slot["type"] = row["type"]
+                if not slot["capabilities"]:
+                    slot["capabilities"] = row["capabilities"]
+                    slot["chat"] = row["chat"]
         return union
+
+    def chat_models(self, loaded_only=True, force=False):
+        """Model ids /v1/chat/completions can actually serve, sorted.
+
+        loaded_only is the default because an installed model that is not loaded
+        cannot answer either: nothing auto-loads on this hardware.
+        """
+        union = self.index(force)
+        return [model_id for model_id in sorted(union)
+                if union[model_id]["chat"]
+                and (union[model_id]["loaded_on"] or not loaded_only)]
 
     def route(self, model_id, force=False):
         """Pick a device that has this model loaded, or explain why none can.

@@ -272,6 +272,13 @@ textarea { resize: vertical; min-height: 42px; width: 100%; }
 #view-chat[hidden] { display: none; }
 .chat-bar { display: flex; align-items: flex-end; gap: 16px; margin-bottom: 13px; }
 .chat-bar .muted { padding-bottom: 4px; }
+/* A real button, so it is reachable by keyboard, that reads as a link: the
+   Models page is a view in this app and not a URL to navigate to. */
+.linklike {
+  background: none; border: 0; padding: 0; font: inherit; color: var(--green);
+  cursor: pointer; text-decoration: underline; text-underline-offset: 2px;
+}
+.linklike:hover { color: var(--green-bright); }
 .chat-log {
   flex: 1; min-height: 340px; overflow-y: auto;
   background: var(--card); border: 1px solid var(--border);

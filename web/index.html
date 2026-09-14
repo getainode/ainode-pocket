@@ -26,7 +26,7 @@
         <div class="endpoint-mini-label">Endpoint</div>
         <code id="mini-endpoint">http://127.0.0.1:8430/v1</code>
       </div>
-      <div class="sidebar-version" id="version">v0.1.0</div>
+      <div class="sidebar-version" id="version">v0.1.1</div>
     </div>
   </aside>
 
@@ -132,8 +132,9 @@
           <div class="chat-empty">
             <div class="chat-empty-mark">◈</div>
             <p>This page talks to <code>/v1/chat/completions</code> on this app,
-               the same endpoint your own clients use. Pick a loaded model and ask
-               it something.</p>
+               the same endpoint your own clients use. The picker lists only
+               models that can chat and are loaded right now, so a speech or
+               embedding model never turns up here.</p>
           </div>
         </div>
         <form class="chat-compose" id="chat-form">
@@ -180,7 +181,7 @@
     </div>
 
     <footer class="footer">
-      <span>AINode Pocket <span id="footer-version">0.1.0</span></span>
+      <span>AINode Pocket <span id="footer-version">0.1.1</span></span>
       <span class="footer-right">
         <svg class="texas" viewBox="0 0 24 24" width="14" height="14"
              fill="currentColor" aria-hidden="true"

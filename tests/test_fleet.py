@@ -431,3 +431,46 @@ class TestRegistration(FakeFleetCase):
         self.assertTrue(self.fleet.forget(self.fake.serial))
         self.assertNotIn(self.fake.serial, self.fleet.devices)
         self.assertEqual(Registry(self.fleet.registry.path).entries, [])
+
+
+class TestChatCapability(FakeFleetCase):
+    """What a model is for, as the device reports it."""
+
+    devices = 2
+
+    def test_the_union_carries_the_answer_per_model(self):
+        index = self.fleet.index(force=True)
+        self.assertFalse(index["Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"]["chat"])
+        self.assertFalse(index["Qwen/Qwen3-Embedding-0.6B"]["chat"])
+        self.assertFalse(index["Qwen/Qwen3-ASR-1.7B"]["chat"])
+        self.assertTrue(index["deepreinforce-ai/Ornith-1.0-35B"]["chat"])
+        self.assertTrue(index["zai-org/GLM-4.7-Flash"]["chat"])
+
+    def test_chat_models_is_loaded_chat_models_only(self):
+        loaded = self.fleet.chat_models()
+        self.assertIn("deepreinforce-ai/Ornith-1.0-35B", loaded)
+        self.assertIn("Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo", loaded)
+        self.assertNotIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", loaded)
+        self.assertNotIn("zai-org/GLM-4.7-Flash", loaded, "installed, not loaded")
+        every = self.fleet.chat_models(loaded_only=False)
+        self.assertIn("zai-org/GLM-4.7-Flash", every)
+        self.assertNotIn("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", every)
+
+    def test_capabilities_beat_the_type_label(self):
+        """The runtime's own answer wins over the store's label."""
+        self.assertTrue(device_mod.can_chat("Text-to-Speech", ["main"]))
+        self.assertFalse(device_mod.can_chat("Text Generation", ["voice"]))
+
+    def test_an_empty_capability_list_falls_back_to_the_type(self):
+        self.assertTrue(device_mod.can_chat("Text Generation", []))
+        self.assertTrue(device_mod.can_chat("Image-Text-to-Text", None))
+        self.assertFalse(device_mod.can_chat("Text-to-Speech", []))
+        self.assertFalse(device_mod.can_chat("Music Generation", []))
+        self.assertFalse(device_mod.can_chat("", []))
+
+    def test_a_type_nobody_has_seen_gets_no_invented_description(self):
+        self.assertEqual(device_mod.type_phrase("Video-to-Haiku"), "")
+        self.assertEqual(device_mod.type_phrase("text-to-speech"),
+                         "a text-to-speech model")
+        self.assertEqual(device_mod.type_phrase("ASR"),
+                         "a speech recognition model")
