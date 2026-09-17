@@ -408,6 +408,8 @@ h4.chat-h, h5.chat-h { font-size: 13px; color: var(--green); }
   line-height: 1.65; white-space: pre-wrap; max-height: 260px; overflow-y: auto;
 }
 .turn-err { color: var(--red); font-size: 12px; }
+/* Under an answer that did arrive, rather than in place of it. */
+.turn-err-tail { margin-top: 9px; }
 .chat-compose { display: flex; gap: 10px; align-items: flex-end; margin-top: 12px; }
 .chat-compose textarea { flex: 1; }
 

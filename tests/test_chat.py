@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import unittest
 import urllib.parse
 import urllib.request
 
@@ -89,6 +90,44 @@ class TestStatsDerivation(ServerCase):
         self.assertEqual(stats["device"]["name"], "tiiny")
         for field in STAT_KEYS:
             self.assertIn(field, stats)
+
+    def test_a_block_the_device_never_sent_reports_nothing_not_zero(self):
+        """A stream that died before the last chunk has no numbers to show.
+
+        The benchmark's derivation answers a missing block with zeroes, because
+        a saved row wants a number in every column. On the chat bar a zero is a
+        claim, and "out 0" beside a turn that really streamed tokens is exactly
+        the kind of invented figure this page exists to not print. The two wall
+        clock figures are this machine's own and survive.
+        """
+        stats = server_mod.chat_stats(
+            None, None, total_ms=168.3, ttft_ms=812.0, finish_reason=None,
+            device={"id": "TNY1", "name": "tiiny"}, model="Qwen/Qwen3-8B")
+        for field in ("prefill_ms", "decode_tok_s", "prefill_tok_s",
+                      "prompt_tokens", "out_tokens", "cached_tokens"):
+            self.assertIsNone(stats[field], field)
+        self.assertEqual(stats["ttft_ms"], 812.0)
+        self.assertEqual(stats["total_ms"], 168.3)
+        for field in STAT_KEYS:
+            self.assertIn(field, stats)
+
+    def test_nothing_streamed_and_nothing_measured_leaves_ttft_null_too(self):
+        """Prefill plus one token is an answer only when the device sent one."""
+        stats = server_mod.chat_stats(
+            None, None, total_ms=20.0, ttft_ms=None, finish_reason=None,
+            device={"id": "TNY1", "name": "tiiny"}, model="Qwen/Qwen3-8B")
+        self.assertIsNone(stats["ttft_ms"])
+
+    def test_usage_without_timings_keeps_the_counts_it_really_has(self):
+        """Half a report is not an excuse to throw the half that arrived away."""
+        stats = server_mod.chat_stats(
+            None, MEASURED_USAGE, total_ms=20.0, ttft_ms=100.0, finish_reason="stop",
+            device={"id": "TNY1", "name": "tiiny"}, model="Qwen/Qwen3-8B")
+        self.assertEqual(stats["prompt_tokens"], 19)
+        self.assertEqual(stats["out_tokens"], 10)
+        self.assertEqual(stats["cached_tokens"], 1)
+        self.assertIsNone(stats["decode_tok_s"])
+        self.assertIsNone(stats["prefill_ms"])
 
 
 class TestChatRoute(ServerCase):
@@ -249,6 +288,163 @@ class TestChatRoute(ServerCase):
             "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(status, 503)
         self.assertIn("no device in this fleet", payload["error"]["message"])
+
+
+class TestSentinel(unittest.TestCase):
+    """Where the relay is allowed to think a stream has ended.
+
+    gateway.chat_stream hands the relay one line at a time, and a JSON string
+    cannot hold a raw newline, so every newline in these bytes is a frame
+    boundary. That is what makes anchoring the sentinel to one enough.
+    """
+
+    def test_the_sentinel_inside_an_answer_is_just_text(self):
+        frame = b'data: {"choices":[{"delta":{"content":"data: [DONE]"}}]}\n'
+        self.assertEqual(server_mod.split_done(frame), (frame, None))
+
+    def test_the_sentinel_on_its_own_line_still_ends_the_stream(self):
+        head, tail = server_mod.split_done(b"data: [DONE]\n\n")
+        self.assertEqual(head, b"")
+        self.assertEqual(tail, b"data: [DONE]\n\n")
+
+    def test_the_error_frame_and_its_sentinel_arrive_in_one_blob(self):
+        """gateway._sse_error writes both, so the split has to find the second."""
+        blob = server_mod.gateway._sse_error("the device gave up")
+        head, tail = server_mod.split_done(blob)
+        self.assertIn(b"the device gave up", head)
+        self.assertEqual(tail, b"data: [DONE]\n\n")
+
+    def test_a_frame_quoting_the_sentinel_before_a_real_one_keeps_both(self):
+        blob = (b'data: {"choices":[{"delta":{"content":"data: [DONE]"}}]}\n'
+                b"data: [DONE]\n\n")
+        head, tail = server_mod.split_done(blob)
+        self.assertTrue(head.endswith(b'}}]}\n'))
+        self.assertEqual(tail, b"data: [DONE]\n\n")
+
+
+class TestRelayEdges(ServerCase):
+    """What the relay does with frames the fake device cannot produce.
+
+    The fake answers like the hardware and it never fails, so these two live
+    where the gateway is replaced for the length of one request: a model that
+    quotes the SSE sentinel in its own answer, and a stream that dies before the
+    chunk carrying timings and usage. Both are about the same thing, which is
+    what the page reports when something goes wrong.
+    """
+
+    class Stub:
+        id, name = "TNY-STUB", "stub Tiiny"
+
+    def relay(self, frames):
+        """(the raw body the browser receives) for a stream of `frames`."""
+        real = server_mod.gateway.chat_stream
+        self.addCleanup(setattr, server_mod.gateway, "chat_stream", real)
+
+        def stub(fleet, body, timeout=600, on_device=None):
+            if on_device is not None:
+                on_device(self.Stub())
+            return 200, None, iter(frames)
+
+        server_mod.gateway.chat_stream = stub
+        req = urllib.request.Request(
+            self.base + "/api/chat", method="POST",
+            data=json.dumps({"model": "Qwen/Qwen3-8B", "stream": True,
+                             "max_tokens": 50,
+                             "messages": [{"role": "user", "content": "x"}]}).encode())
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode()
+
+    @staticmethod
+    def read(blob):
+        """(the assembled answer, the stats event, how many frames were junk)."""
+        text, stats, junk, event = "", None, 0, None
+        for line in blob.splitlines():
+            if line.startswith("event:"):
+                event = line[6:].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                frame = json.loads(data)
+            except ValueError:
+                junk += 1
+                continue
+            if event == "stats":
+                stats, event = frame, None
+                continue
+            for choice in frame.get("choices") or []:
+                text += (choice.get("delta") or {}).get("content") or ""
+        return text, stats, junk
+
+    @staticmethod
+    def content(piece, finish=None):
+        return ('data: %s\n' % json.dumps(
+            {"choices": [{"index": 0, "delta": {"content": piece},
+                          "finish_reason": finish}]})).encode()
+
+    def test_a_model_quoting_the_sentinel_is_relayed_whole(self):
+        """"data: [DONE]" is what a model writes when you ask it about streaming.
+
+        It arrives here inside a frame's JSON, and cutting the relay at it broke
+        three things in one go: the browser got a frame it could not parse, the
+        answer stopped mid-sentence with nothing saying why, and the gateway's
+        last chunk was never read, so the whole point of the release, the
+        numbers, came back as zeroes.
+        """
+        frames = [self.content("An SSE stream ends with "),
+                  self.content("data: [DONE]"),
+                  self.content(" and then closes.", finish="stop"),
+                  ('data: %s\n' % json.dumps(
+                      {"choices": [], "timings": MEASURED_TIMINGS,
+                       "usage": MEASURED_USAGE})).encode(),
+                  b"data: [DONE]\n\n"]
+        blob = self.relay(frames)
+        text, stats, junk = self.read(blob)
+        self.assertEqual(text, "An SSE stream ends with data: [DONE] and then closes.")
+        self.assertEqual(junk, 0, "a frame was cut in half")
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["out_tokens"], 10)
+        self.assertEqual(stats["prompt_tokens"], 19)
+        self.assertEqual(stats["finish_reason"], "stop")
+        self.assertGreater(stats["decode_tok_s"], 0)
+        # Still exactly one of each, in the order that puts the numbers where a
+        # reader that stops at the sentinel will still see them.
+        self.assertEqual(blob.count("data: [DONE]"), 2)  # one quoted, one real
+        self.assertEqual(blob.count("event: stats"), 1)
+        self.assertLess(blob.index("event: stats"), blob.rindex("data: [DONE]"))
+        self.assertTrue(blob.rstrip().endswith("data: [DONE]"))
+
+    def test_a_stream_that_failed_reports_nothing_rather_than_zeroes(self):
+        """The 220 second cap is the common way for a stream to end badly.
+
+        The tokens that already streamed are real, which is what the gateway's
+        own sentence says, and the numbers for them never arrive. Saying "out 0"
+        there would contradict the error sitting directly above it.
+        """
+        frames = [self.content("An SSE stream ends with "),
+                  self.content("a sentinel."),
+                  server_mod.gateway._sse_error(
+                      "stub Tiiny timed out after 220 s. The gateway closes a "
+                      "request at about 220 seconds; the tokens already streamed "
+                      "above are real.")]
+        blob = self.relay(frames)
+        text, stats, junk = self.read(blob)
+        self.assertEqual(junk, 0)
+        self.assertEqual(text, "An SSE stream ends with a sentinel.")
+        self.assertIn("timed out after 220 s", blob)
+        self.assertIsNotNone(stats, "the stats event is still appended")
+        for field in ("prefill_ms", "decode_tok_s", "prefill_tok_s",
+                      "prompt_tokens", "out_tokens", "cached_tokens"):
+            self.assertIsNone(stats[field], field)
+        self.assertIsNone(stats["finish_reason"])
+        # The two figures this machine measured itself are real and stay.
+        self.assertIsNotNone(stats["ttft_ms"])
+        self.assertGreater(stats["total_ms"], 0)
+        self.assertEqual(stats["device"]["name"], "stub Tiiny")
 
 
 class TestModelCard(ServerCase):
@@ -535,3 +731,34 @@ class TestChatPage(ServerCase):
                       "out_tokens", "finish_reason", "npu_used", "npu_total",
                       "loaded_on", "can_chat", "catalog_url"):
             self.assertIn(field, body, field)
+
+    def test_the_whole_request_is_never_labelled_thinking_time(self):
+        """The thinking clock stops at the first word of the answer.
+
+        Only a stream sees that boundary. When the reply arrives in one piece
+        nothing does, and stamping the wall clock there reported prefill plus
+        reasoning plus the entire answer as "thinking", so the same model and
+        the same question gave two different durations depending on whether
+        Stream was ticked. There is no JS runner in this repo, so what is held
+        here is the guard itself: every place the page stamps that clock is
+        either the streamed delta handler or gated on the turn having streamed.
+        """
+        status, body = self.request("/app.js")
+        self.assertEqual(status, 200)
+        guards = re.findall(r"if \(([^()]*think_s === null[^()]*)\)", body)
+        self.assertTrue(guards, "nothing stamps think_s any more; check this test")
+        for guard in guards:
+            if "live.streamed" in guard:
+                continue
+            self.assertIn("!live.msg.content", guard,
+                          "a wall clock stamp that is neither streamed nor guarded")
+
+    def test_a_thinking_time_too_short_to_print_is_not_printed(self):
+        """Rounded to a tenth, a sub-50 ms pause reads "thinking, 0.0 s".
+
+        That is a measurement of nothing dressed as a measurement, and the label
+        already has an honest form for a duration nobody timed: the bare word.
+        """
+        status, body = self.request("/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn("Number(msg.think_s) >= 0.05", body)

@@ -56,20 +56,29 @@ def chat_stats(timings, usage, total_ms, ttft_ms, finish_reason, device, model):
     and the same number in a saved benchmark mean the same thing. Only the two
     wall clock figures belong to this machine: when the first token arrived and
     how long the whole request took, neither of which the device can see.
+
+    A block the device never sent reports null here, not zero. The benchmark's
+    derivation answers a missing block with zeroes because a saved row wants a
+    number in every column, but on this page a zero is a claim: a stream that
+    died at the 220 second cap never reaches the chunk carrying these blocks,
+    and "out 0" beside a turn that really streamed four hundred tokens is the
+    one kind of lie a release about trustworthy numbers cannot tell. The page
+    prints a dash for null, which says the device did not report it.
     """
     derived = bench_mod.derive_stats(timings, usage)
-    if ttft_ms is None:
+    measured, counted = bool(timings), bool(usage) or bool(timings)
+    if ttft_ms is None and measured:
         # Nothing streamed, so there was no first token to time here. The
         # device's own answer is prefill plus one token of decode, which is what
         # the benchmark reports for the same request.
         ttft_ms = round(derived["ttft_s"] * 1000, 1)
     return {"ttft_ms": ttft_ms,
-            "prefill_ms": derived["prefill_ms"],
-            "decode_tok_s": derived["decode_tok_s"],
-            "prefill_tok_s": derived["prefill_tok_s"],
-            "prompt_tokens": derived["prompt_tokens"],
-            "out_tokens": derived["out_tokens"],
-            "cached_tokens": derived["cached_tokens"],
+            "prefill_ms": derived["prefill_ms"] if measured else None,
+            "decode_tok_s": derived["decode_tok_s"] if measured else None,
+            "prefill_tok_s": derived["prefill_tok_s"] if measured else None,
+            "prompt_tokens": derived["prompt_tokens"] if counted else None,
+            "out_tokens": derived["out_tokens"] if counted else None,
+            "cached_tokens": derived["cached_tokens"] if usage else None,
             "total_ms": round(total_ms, 1),
             "finish_reason": finish_reason,
             "device": device,
@@ -115,11 +124,29 @@ def catalog_url(model_id):
 
 
 def split_done(blob):
-    """(everything before the [DONE] line, the [DONE] line and what follows)."""
-    index = blob.find(DONE_LINE)
-    if index < 0:
-        return blob, None
-    return blob[:index], blob[index:]
+    """(everything before the [DONE] line, the [DONE] line and what follows).
+
+    The sentinel counts only as a whole line of its own. Ask a model about
+    streaming and it writes "data: [DONE]" into its answer, where it reaches
+    this function inside a frame's JSON string: a match anywhere in the bytes
+    cut that frame in half, so the browser got something it could not parse, the
+    answer stopped mid-sentence with nothing saying why, and the gateway's last
+    chunk, the one carrying timings and usage, was never read. The release whose
+    whole point is the numbers then reported zeroes. A JSON string cannot hold a
+    raw newline, so a newline in this blob is always a frame boundary and
+    anchoring to one is enough.
+    """
+    index = 0
+    while True:
+        index = blob.find(DONE_LINE, index)
+        if index < 0:
+            return blob, None
+        starts_line = index == 0 or blob[index - 1:index] == b"\n"
+        ends_line = blob[index + len(DONE_LINE):index + len(DONE_LINE) + 1] in (
+            b"", b"\n", b"\r")
+        if starts_line and ends_line:
+            return blob[:index], blob[index:]
+        index += len(DONE_LINE)
 
 
 class ChatWatch:

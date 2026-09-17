@@ -35,6 +35,15 @@ that decides whether reasoning is asked for at all, because on this hardware a
 chain of thought spends the same `max_tokens` budget the answer needs, and with a
 modest cap it spends all of it.
 
+When a request goes wrong the bar prints a dash rather than a number. A stream
+that dies at the gateway's 220 second cap never reaches the chunk carrying
+`timings` and `usage`, so there is nothing to report for decode rate or tokens
+out, and printing a zero there would contradict the error sitting directly above
+it. Time to first token and total wall time are measured on this side and survive,
+so they still show. The reasoning summary follows the same rule: it names a
+duration only when something actually watched the chain of thought stop, which is
+the streamed path.
+
 Four routes are new, all of them the page's own rather than the OpenAI endpoint's:
 
 ```
@@ -430,7 +439,7 @@ python3 ainode-pocket --selfcheck                  offline check, no hardware
 python3 -m unittest discover -s tests
 ```
 
-224 tests, no hardware and no network beyond loopback. They run against a fake
+235 tests, no hardware and no network beyond loopback. They run against a fake
 device that reproduces the recorded response shapes, and each assertion in
 `tests/test_fake.py` names the artefact its shape came from. The fake also
 reproduces both failures that matter, so the code has actually met them: the
@@ -529,7 +538,7 @@ pocket/server.py       the HTTP server, the JSON API, static assets
 pocket/bench.py        tiiny-bench, embedded
 pocket/fake.py         a fake device built from the recorded artefacts
 web/                   the page: one html, one css, one js
-tests/                 224 tests, no hardware
+tests/                 235 tests, no hardware
 manifests/             the tiinyapp.farm manifest
 ```
 

@@ -963,11 +963,17 @@ function messageNode(msg) {
   think.__body = thinkBody;
   box.appendChild(think);
   var body = el('div', 'turn-body turn-md');
+  // Its own line under the answer, because a stream that died part way has both
+  // an answer and an error and they are not the same thing.
+  var oops = el('div', 'turn-err turn-err-tail');
+  oops.hidden = true;
   var stats = el('div', 'stats-slot');
   box.appendChild(body);
+  box.appendChild(oops);
   box.appendChild(stats);
   box.__think = think;
   box.__body = body;
+  box.__err = oops;
   box.__stats = stats;
   paintMessage(box, msg);
   return box;
@@ -978,12 +984,15 @@ function paintMessage(box, msg) {
   if (msg.reasoning) {
     think.hidden = false;
     think.__body.textContent = msg.reasoning;
-    think.__summary.textContent = msg.think_s
+    // Under fifty milliseconds there is no tenth of a second to print, and
+    // "thinking, 0.0 s" reads as a measurement of nothing rather than as the
+    // bare label the code already has for a duration nobody timed.
+    think.__summary.textContent = Number(msg.think_s) >= 0.05
       ? 'thinking, ' + Number(msg.think_s).toFixed(1) + ' s' : 'thinking';
   } else {
     think.hidden = true;
   }
-  if (msg.error) {
+  if (msg.error && !msg.content) {
     box.__body.className = 'turn-body turn-err';
     box.__body.textContent = msg.error;
   } else if (!msg.content && msg.note) {
@@ -994,6 +1003,11 @@ function paintMessage(box, msg) {
     box.__body.className = 'turn-body turn-md';
     box.__body.innerHTML = renderMarkdown(msg.content);
   }
+  // The gateway's timeout sentence ends "the tokens already streamed above are
+  // real", and overwriting the answer with it left nothing above for it to
+  // point at. When both exist, both are shown.
+  box.__err.hidden = !(msg.error && msg.content);
+  if (msg.error && msg.content) box.__err.textContent = msg.error;
   box.__stats.textContent = '';
   if (msg.stats) {
     box.__stats.appendChild(statsBar(msg.stats));
@@ -1042,7 +1056,9 @@ function statsBar(stats) {
   bar.appendChild(chip('on', where));
   // "length" is not a footnote on a reasoning model: it means the answer was
   // cut off, and on this firmware a modest cap is spent entirely on thinking.
-  bar.appendChild(chip('stop', stats.finish_reason || '-', stats.finish_reason === 'length',
+  // The label is the field, finish_reason, rather than one of its two values,
+  // which is what had the commonest answer reading "stop stop".
+  bar.appendChild(chip('finish', stats.finish_reason || '-', stats.finish_reason === 'length',
     stats.finish_reason === 'length'
       ? 'the token budget ran out before the model finished' : ''));
   return bar;
@@ -1408,7 +1424,7 @@ function send(text, maxOverride) {
   currentConv.messages.push(reply);
   var node = messageNode(reply);
   turns.appendChild(node);
-  live = { msg: reply, node: node, started: Date.now(),
+  live = { msg: reply, node: node, started: Date.now(), streamed: config.stream,
            thinking: config.thinking, finish: null };
   chatBusy = true;
   $('#chat-send').disabled = true;
@@ -1529,7 +1545,15 @@ function finishTurn() {
   if (live) {
     var msg = live.msg;
     var node = live.node;
-    if (msg.reasoning && msg.think_s === null) {
+    // A stream that carried reasoning and never reached an answer thought right
+    // up to the end, so the whole request is the thinking time. Nothing watches
+    // that boundary when the reply arrives in one piece: there the request is
+    // prefill plus reasoning plus the entire answer, and labelling that
+    // "thinking" made the same model and the same question report two different
+    // durations depending on whether Stream was ticked. The device does not
+    // split its timings at the end of the chain of thought either, so there is
+    // no honest number to print and the label stays bare.
+    if (msg.reasoning && msg.think_s === null && live.streamed) {
       msg.think_s = (Date.now() - live.started) / 1000;
     }
     if (msg.stats && !msg.stats.finish_reason && live.finish) {
@@ -1825,7 +1849,9 @@ function demoChat(body) {
   if (!body.stream) {
     live.msg.content = answer;
     live.msg.reasoning = reasoning;
-    if (reasoning) live.msg.think_s = 4.1;
+    // No think_s: a reply that arrives in one piece has nothing that saw when
+    // the chain of thought stopped, and the fixture shows what the real route
+    // shows or it is not worth having.
     handleStats(stats);
     return finishTurn();
   }
