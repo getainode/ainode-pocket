@@ -227,7 +227,17 @@ def chat_stream(fleet, body, timeout=600, on_device=None):
                             # reading at the first, so the second was never seen
                             # and anything appended after it never would be.
                             continue
-                        yield (line if line.endswith("\n") else line + "\n").encode()
+                        # A server-sent event ends with a blank line. The device
+                        # sends one data: line per frame and then the blank, and
+                        # the blank was being dropped above, so what left here
+                        # was one long frame that only a lenient parser could
+                        # read. Every data: line gets its terminator back; a
+                        # field line that is not data: (event:, id:) belongs to
+                        # the frame that follows it and stays single spaced.
+                        if stripped.startswith("data:"):
+                            yield (stripped + "\n\n").encode()
+                        else:
+                            yield (stripped + "\n").encode()
                 except device_mod.DeviceBusy:
                     busy = True
                 except device_mod.DeviceTimeout as exc:
