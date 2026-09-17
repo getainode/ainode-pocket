@@ -12,6 +12,56 @@ One command, one page on port 8430, one base URL for your clients. Python 3.9 or
 
 ---
 
+## What changed in 0.1.3
+
+The Chat page reports what every answer cost. This is a benchmarking utility and
+the chat was the one place in it that produced no numbers at all, which made it
+the only page you could not learn anything from.
+
+Every assistant message now carries a stats bar: time to first token, decode
+rate, total wall time, tokens in and out, which device and model served it, and
+why generation stopped. The numbers are the device's own `timings` and `usage`
+blocks read through `pocket/bench.py:derive_stats`, the same function the
+benchmark uses, so a number in the chat bar and the same number in a saved
+benchmark mean the same thing. Only two figures are measured on this side: when
+the first token arrived, and how long the whole request took. The bar is kept
+with the message, so scrolling back up shows what that answer cost rather than
+what the last one did.
+
+Around it: a model card for whatever is in the picker, an instances rail showing
+every loaded model on every device with an unload button, and a panel for loading
+a chat model onto a device. The reasoning block is collapsible and has a toggle
+that decides whether reasoning is asked for at all, because on this hardware a
+chain of thought spends the same `max_tokens` budget the answer needs, and with a
+modest cap it spends all of it.
+
+Four routes are new, all of them the page's own rather than the OpenAI endpoint's:
+
+```
+POST /api/chat                 a completion with the numbers attached. Streamed,
+                               the last event before [DONE] is `event: stats`
+GET  /api/model_card?model=    one model: size, units, capabilities, which
+                               devices have it loaded, whether it can chat
+GET  /api/instances            every loaded model on every device, live, plus
+                               each device's NPU budget
+POST /api/instances/load       load a chat model onto one device, 202 and poll
+POST /api/instances/unload     unload one, 202
+```
+
+`/api/instances/load` refuses a model that is not installed on that device, one
+that cannot chat, and one that does not fit the remaining NPU budget. That last
+refusal is the interesting one: **the device does not refuse it itself.** Measured
+on real hardware, a start that does not fit comes back with the same 200 and the
+same `start loading` message a load that fits gets, the model appears in
+`npu/status` as `loading`, and then it disappears. No error is returned anywhere.
+Worse, the subtraction is not the whole constraint: with a 28 unit model resident
+and 64 units free, three separate 50 to 55 unit models were all rolled back. So
+the panel refuses the obvious case up front and polls afterwards for the rest,
+and a load is only believed when the status says running **and** a one token chat
+comes back.
+
+---
+
 ## What it does
 
 **Finds and registers devices.** Press Find devices and Pocket broadcasts the
@@ -33,8 +83,10 @@ server-sent-events endpoint.
 `/v1/chat/completions` routes by model id, streaming or not, over whichever
 address and transport that device actually answers on.
 
-**Chats and benchmarks.** A chat page that talks to that same endpoint, and the
-tiiny-bench suite embedded as a page and a CLI subcommand.
+**Chats and benchmarks.** A chat page that talks to that same endpoint and
+reports what every answer cost, beside a model card and a panel for loading and
+unloading models, and the tiiny-bench suite embedded as a page and a CLI
+subcommand.
 
 ## What it deliberately does not do
 
@@ -300,10 +352,25 @@ resident at once, only one of them runs at a time.
 
 ### Chat
 
-The chat page is an ordinary client of `/v1/chat/completions` on this app. The
-header of a reply says which device answered it. A reasoning model's chain of
-thought is shown separately from the answer, because it is spending the same
-`max_tokens` budget the answer needs.
+The chat page talks to `/api/chat` on this app, which is `/v1/chat/completions`
+with the device's own measurements carried back beside the answer. Under every
+reply is what it cost: time to first token, decode tokens per second, total wall
+time, tokens in and out, the device and model that served it, and the stop
+reason. A `length` there is not a failure, it is the answer running into
+`max_tokens`, and on a reasoning model with a modest cap it is the ordinary case.
+
+The card on the left is the model in the picker: what it is, how big it is, how
+many NPU units it takes, which devices have it loaded. The rail on the right is
+every model loaded across the fleet with its unit cost and an unload button, and
+below it a panel to load a chat model onto a device.
+
+A reasoning model's chain of thought is shown separately from the answer, in a
+block you can collapse, because it is spending the same `max_tokens` budget the
+answer needs. The Thinking toggle decides whether any is asked for: only
+`chat_template_kwargs.enable_thinking` actually turns it off on this firmware,
+which is what that toggle sends. The gateway's own OpenAPI document declares a
+top level `enable_thinking` beside `thinking_enabled`, `reasoning_effort` and
+`thinking_budget_tokens`, and the runtime ignores every one of them.
 
 The picker lists only models that can chat and are loaded right now, grouped by
 the device holding them, and it defaults to the first of those. A box commonly
@@ -363,7 +430,7 @@ python3 ainode-pocket --selfcheck                  offline check, no hardware
 python3 -m unittest discover -s tests
 ```
 
-140 tests, no hardware and no network beyond loopback. They run against a fake
+218 tests, no hardware and no network beyond loopback. They run against a fake
 device that reproduces the recorded response shapes, and each assertion in
 `tests/test_fake.py` names the artefact its shape came from. The fake also
 reproduces both failures that matter, so the code has actually met them: the
@@ -433,7 +500,7 @@ These need a write, a second box, or a cable, so they were left alone:
 | # | Check | Expected |
 |---|---|---|
 | 1 | Load a small model (the 0.6B embedding model, 1 unit) | appears in the running list within seconds |
-| 2 | Load something that does not fit the remaining budget | refused with the device's own message |
+| 2 | Load something that does not fit the remaining budget | **measured 2026-09-14, and this expectation was wrong**: accepted with the same 200, shown as `loading`, then silently rolled back. Pocket refuses it before the device sees it |
 | 3 | Unload it | disappears; the response carries `removed_container_ids` |
 | 4 | Download from the catalog | progress advances and the SSE stream ends at 100 |
 | 5 | Delete a loaded model | refused with 409, as the spec declares |
@@ -462,7 +529,7 @@ pocket/server.py       the HTTP server, the JSON API, static assets
 pocket/bench.py        tiiny-bench, embedded
 pocket/fake.py         a fake device built from the recorded artefacts
 web/                   the page: one html, one css, one js
-tests/                 140 tests, no hardware
+tests/                 218 tests, no hardware
 manifests/             the tiinyapp.farm manifest
 ```
 

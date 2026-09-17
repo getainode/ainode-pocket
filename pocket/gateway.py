@@ -167,13 +167,19 @@ def chat(fleet, body, timeout=240):
     return error(503, "no device answered", "model_not_available")
 
 
-def chat_stream(fleet, body, timeout=600):
+def chat_stream(fleet, body, timeout=600, on_device=None):
     """A streaming completion.
 
     Returns (status, payload, None) for a failure that happens before any bytes
     go out, or (200, None, generator) where the generator yields SSE bytes. The
     device lock is held for the whole stream, which is the only way a second
     caller genuinely queues rather than colliding.
+
+    `on_device` is called with the device this request was routed to, before any
+    byte leaves. A non-streamed reply says which box answered in its
+    ainode_pocket block; a stream has nowhere to put that, and the chat page has
+    to name the device beside the numbers, so the caller is told directly rather
+    than routing a second time and possibly getting a different answer.
     """
     bad = _validate(body)
     if bad:
@@ -187,6 +193,8 @@ def chat_stream(fleet, body, timeout=600):
     except NoDevice as exc:
         status, payload = error(503, str(exc), "model_not_available")
         return status, payload, None
+    if on_device is not None:
+        on_device(dev)
 
     def produce():
         fd = lock.acquire(why="chat stream %s" % model_id)
@@ -212,6 +220,13 @@ def chat_stream(fleet, body, timeout=600):
                                 busy = True
                                 break
                         saw_content = True
+                        if stripped == "data: [DONE]":
+                            # The device ends its stream with one and this
+                            # generator appends its own below, so relaying the
+                            # device's put two in every stream. A client stops
+                            # reading at the first, so the second was never seen
+                            # and anything appended after it never would be.
+                            continue
                         yield (line if line.endswith("\n") else line + "\n").encode()
                 except device_mod.DeviceBusy:
                     busy = True

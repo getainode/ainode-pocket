@@ -180,9 +180,16 @@ class TestRecordedShapes(FakeFleetCase):
                          "/api/v1/models/Qwen/Qwen3-Embedding-0.6B/start")
         self.assertEqual(status, 404)
 
-    def test_npu_budget_refuses_an_overcommit(self):
-        # CAPABILITIES.md: residency is capped at 100 units. Ornith (50) plus the
-        # Coder Turbo (45) leaves 5, so a 30-unit model cannot fit.
+    def test_an_overcommitted_load_is_accepted_and_then_rolled_back(self):
+        """Measured 2026-09-14: the device does not refuse a load that will not fit.
+
+        CAPABILITIES.md caps residency at 100 units. Ornith (50) plus the Coder
+        Turbo (45) leaves 5, so a 30 unit model cannot fit. The start is accepted
+        anyway, with the same 200 and the same "start loading" message a load
+        that fits gets, the model shows up in npu/status as loading, and then it
+        disappears with no error anywhere. Polling this endpoint is the only way
+        to tell, which is why the load panel polls it.
+        """
         self.fake.state.installed.append("openai/gpt-oss-20b")
         status, _ = post(
             self.fake.base, "/api/v1/models/%s/start"
@@ -192,8 +199,22 @@ class TestRecordedShapes(FakeFleetCase):
             self.fake.base,
             "/api/v1/models/%s/start"
             % urllib.parse.quote("openai/gpt-oss-20b", safe=""))
-        self.assertEqual(status, 400)
-        self.assertIn("NPU units", payload["detail"])
+        self.assertEqual(status, 200)
+        self.assertIn("start loading", payload["message"])
+
+        def units():
+            _, body = get(self.fake.base, "/api/v1/models/npu/status")
+            return {row["model_id"]: row["status"] for row in body["models"]}
+
+        self.assertEqual(units().get("openai/gpt-oss-20b"), "loading")
+        for _ in range(fake_mod.LOAD_POLLS + 2):
+            rolled_back = "openai/gpt-oss-20b" not in units()
+            if rolled_back:
+                break
+        self.assertTrue(rolled_back, "an unfit load vanishes rather than erroring")
+        # And the one that did fit came up.
+        self.assertEqual(units().get("Qwen/Qwen3-Coder-30B-A3B-Instruct-Turbo"),
+                         "running")
 
     def test_inference_against_an_unloaded_model(self):
         # RUNBOOK.md: models do not auto-load, and this is the exact body.
@@ -216,8 +237,11 @@ class TestRecordedShapes(FakeFleetCase):
         self.assertIn("completion_tokens", payload["usage"])
 
     def test_streaming_splits_reasoning_from_content(self):
-        body = json.dumps({"model": self.loaded_model(), "max_tokens": 12,
+        # chat_template_kwargs.enable_thinking is the only knob the runtime
+        # honours, measured 2026-09-16, so it is the only one the fake reads.
+        body = json.dumps({"model": self.loaded_model(), "max_tokens": 40,
                            "stream": True,
+                           "chat_template_kwargs": {"enable_thinking": True},
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         req = urllib.request.Request(self.fake.base + "/v1/chat/completions",
                                      data=body, method="POST")
@@ -240,6 +264,82 @@ class TestRecordedShapes(FakeFleetCase):
         self.assertTrue(done)
         self.assertTrue(reasoning, "reasoning models split output into reasoning_content")
         self.assertTrue(content)
+
+    def test_thinking_off_asks_for_no_reasoning_and_gets_none(self):
+        """The toggle is not cosmetic: with it off nothing is reasoned at all."""
+        status, payload = post(self.fake.base, "/v1/chat/completions", {
+            "model": self.loaded_model(), "max_tokens": 16,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        self.assertNotIn("reasoning_content", payload["choices"][0]["message"])
+        status, payload = post(self.fake.base, "/v1/chat/completions", {
+            "model": self.loaded_model(), "max_tokens": 16,
+            "chat_template_kwargs": {"enable_thinking": True},
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        # Non-streamed it arrives beside the answer in the message, not wrapped
+        # in tags inside the content.
+        self.assertTrue(payload["choices"][0]["message"]["reasoning_content"])
+        # And the device charges for it: reasoning is spent out of max_tokens
+        # before the answer is.
+        self.assertEqual(payload["usage"]["completion_tokens"], 16)
+
+    def test_a_stream_carries_usage_only_when_it_is_asked_for(self):
+        """stream_options.include_usage, measured 2026-09-16.
+
+        Without it a stream carries no timings and no usage anywhere, which is
+        why the chat page has to ask. With it the gateway adds one last chunk
+        whose choices list is empty, after the frame carrying finish_reason.
+        """
+        for ask in (False, True):
+            body = {"model": self.loaded_model(), "max_tokens": 12, "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}]}
+            if ask:
+                body["stream_options"] = {"include_usage": True}
+            frames = self.stream_frames(body)
+            carriers = [f for f in frames if "usage" in f]
+            self.assertEqual(bool(carriers), ask)
+            if not ask:
+                continue
+            last = carriers[-1]
+            self.assertEqual(last["choices"], [])
+            self.assertEqual(frames[-1], last, "it is the final chunk before [DONE]")
+            for field in ("cache_n", "prompt_n", "prompt_ms", "prompt_per_second",
+                          "prompt_per_token_ms", "predicted_n", "predicted_ms",
+                          "predicted_per_second", "predicted_per_token_ms"):
+                self.assertIn(field, last["timings"])
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                self.assertIn(field, last["usage"])
+            self.assertIn("cached_tokens", last["usage"]["prompt_tokens_details"])
+
+    def test_the_stop_reason_says_whether_the_cap_was_hit(self):
+        status, payload = post(self.fake.base, "/v1/chat/completions", {
+            "model": self.loaded_model(), "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(payload["choices"][0]["finish_reason"], "length")
+        status, payload = post(self.fake.base, "/v1/chat/completions", {
+            "model": self.loaded_model(), "max_tokens": fake_mod.TOKEN_CAP + 10,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
+
+    def stream_frames(self, body):
+        """Every JSON frame of a streamed completion, in order."""
+        req = urllib.request.Request(self.fake.base + "/v1/chat/completions",
+                                     data=json.dumps(body).encode(), method="POST")
+        req.add_header("Authorization", "Bearer " + fake_mod.KEY)
+        req.add_header("Content-Type", "application/json")
+        frames = []
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            for raw in resp:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                frames.append(json.loads(payload))
+        return frames
 
     def test_download_stream_reports_progress_then_installs(self):
         model = "openai/gpt-oss-20b"

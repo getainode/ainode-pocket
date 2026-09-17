@@ -93,6 +93,38 @@ def _telemetry(dev):
             "cpu_total_pct": cpu.get("total_percent")}
 
 
+def derive_stats(timings, usage, wall_s=None):
+    """The numbers a completion reports about itself, from the gateway's own blocks.
+
+    This is the benchmark's measurement and the Chat page shows the same numbers
+    under the same names, so there is one derivation and both callers use it. Two
+    of these would drift the first time the gateway renamed a field, and then the
+    chat bar and the saved benchmark would disagree about the same request.
+
+    `timings` and `usage` are the blocks the gateway sends: at the top level of a
+    non-streamed completion, and in the final chunk of a stream asked for with
+    stream_options.include_usage. Nothing here is computed from a clock on this
+    side, which is why the chat route adds its own measured ttft_ms on top rather
+    than replacing ttft_s: ttft_s is prefill plus one token's decode time, the
+    only answer available when the whole reply arrives at once.
+    """
+    timings = timings or {}
+    usage = usage or {}
+    stats = {
+        "prompt_tokens": usage.get("prompt_tokens", timings.get("prompt_n", 0)),
+        "out_tokens": usage.get("completion_tokens", timings.get("predicted_n", 0)),
+        "prefill_tok_s": round(timings.get("prompt_per_second") or 0, 2),
+        "decode_tok_s": round(timings.get("predicted_per_second") or 0, 2),
+        "prefill_ms": round(timings.get("prompt_ms") or 0, 1),
+        "ttft_s": round((timings.get("prompt_ms") or 0) / 1000
+                        + (timings.get("predicted_per_token_ms") or 0) / 1000, 3),
+        "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+    }
+    if wall_s is not None:
+        stats["wall_s"] = round(wall_s, 3)
+    return stats
+
+
 def _chat(dev, lock, model, prompt, max_tokens, thinking=False, timeout=240):
     body = {"model": model, "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": thinking},
@@ -104,19 +136,7 @@ def _chat(dev, lock, model, prompt, max_tokens, thinking=False, timeout=240):
     except device_mod.DeviceError as exc:
         return {"error": str(exc)[:160], "wall_s": round(time.time() - started, 2)}
     wall = time.time() - started
-    timings = (payload or {}).get("timings") or {}
-    usage = (payload or {}).get("usage") or {}
-    return {
-        "wall_s": round(wall, 3),
-        "prompt_tokens": usage.get("prompt_tokens", timings.get("prompt_n", 0)),
-        "out_tokens": usage.get("completion_tokens", timings.get("predicted_n", 0)),
-        "prefill_tok_s": round(timings.get("prompt_per_second") or 0, 2),
-        "decode_tok_s": round(timings.get("predicted_per_second") or 0, 2),
-        "prefill_ms": round(timings.get("prompt_ms") or 0, 1),
-        "ttft_s": round((timings.get("prompt_ms") or 0) / 1000
-                        + (timings.get("predicted_per_token_ms") or 0) / 1000, 3),
-        "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
-    }
+    return derive_stats((payload or {}).get("timings"), (payload or {}).get("usage"), wall)
 
 
 def t_prefill(run, dev, lock, model, reps=(2, 12, 60, 240)):

@@ -491,9 +491,15 @@ class Fleet:
                             "cores": len(cpu.get("per_core_percent") or [])}
             value["running"] = list(running.get("running") or [])
             instances = (running.get("instances") or {}).get("running") or []
+            # status and instance_id were being dropped here, which made a model
+            # that is still coming up indistinguishable from one that will
+            # answer. The device sends both, and a load is only believable when
+            # something can read the difference.
             value["instances"] = [
                 {"model_id": inst.get("model_id"), "port": inst.get("port"),
-                 "npu_usage": inst.get("npu_usage")}
+                 "npu_usage": inst.get("npu_usage"),
+                 "status": inst.get("status"),
+                 "instance_id": inst.get("instance_id")}
                 for inst in instances if isinstance(inst, dict)]
             value["thermal"] = self._thermal(dev)
             info = {}

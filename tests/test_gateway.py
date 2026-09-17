@@ -162,12 +162,16 @@ class TestQueueing(FakeFleetCase):
 class TestStreaming(FakeFleetCase):
     def test_a_stream_yields_frames_then_done(self):
         status, error, stream = gateway.chat_stream(self.fleet, {
-            "model": "deepreinforce-ai/Ornith-1.0-35B", "max_tokens": 16,
+            "model": "deepreinforce-ai/Ornith-1.0-35B", "max_tokens": 40,
+            "chat_template_kwargs": {"enable_thinking": True},
             "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(status, 200)
         self.assertIsNone(error)
         blob = b"".join(stream).decode()
         self.assertIn("chat.completion.chunk", blob)
+        # Reasoning comes back because this request asked for it. Nothing in the
+        # endpoint adds or strips the flag: the device's frames go through as
+        # they arrive.
         self.assertIn("reasoning_content", blob)
         self.assertTrue(blob.rstrip().endswith("data: [DONE]"))
 

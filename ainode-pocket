@@ -259,6 +259,7 @@ def cmd_selfcheck(args):
     port = httpd.server_address[1]
     import threading
     import urllib.error
+    import urllib.parse
     import urllib.request
     thread = threading.Thread(target=httpd.serve_forever,
                               kwargs={"poll_interval": 0.1}, daemon=True)
@@ -297,8 +298,9 @@ def cmd_selfcheck(args):
               and bool(state.get("chat_models"))
               and all(row["model_id"] in [r["id"] for r in ready]
                       for row in state.get("chat_models", [])))
-        check("web assets present", os.path.isfile(os.path.join(server_mod.WEB_DIR,
-                                                               "index.html")))
+        check("web assets present",
+              all(os.path.isfile(os.path.join(server_mod.WEB_DIR, name))
+                  for name in ("index.html", "app.css", "app.js")))
         if speech:
             status, refusal = post("/v1/chat/completions", {
                 "model": speech[0]["id"], "max_tokens": 8,
@@ -317,6 +319,23 @@ def cmd_selfcheck(args):
                 "messages": [{"role": "user", "content": "hi"}]})
             check("503 names the reason", status == 503
                   and "fleet" in refusal["error"]["message"])
+            # The chat page is a benchmarking surface, so an answer with no
+            # numbers on it is a failure even when the words came back.
+            status, reply = post("/api/chat", {
+                "model": ready[0]["id"], "max_tokens": 24, "thinking": False,
+                "messages": [{"role": "user", "content": "hello"}]})
+            stats = (reply or {}).get("stats") or {}
+            check("/api/chat carries the numbers",
+                  status == 200 and stats.get("out_tokens")
+                  and stats.get("decode_tok_s") and stats.get("device", {}).get("name"),
+                  json.dumps(stats)[:200])
+            status, card = get("/api/model_card?model="
+                               + urllib.parse.quote(ready[0]["id"], safe=""))
+            check("/api/model_card", status == 200 and card.get("can_chat") is True
+                  and bool(card.get("loaded_on")), json.dumps(card)[:200])
+        status, rail = get("/api/instances")
+        check("/api/instances", status == 200 and bool(rail.get("instances"))
+              and rail["devices"][0]["npu_total"] > 0, json.dumps(rail)[:200])
     finally:
         httpd.shutdown()
         httpd.server_close()

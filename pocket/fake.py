@@ -59,6 +59,28 @@ Verified against live hardware on 2026-09-13, and no longer guesses:
     the USB /30 and the per-interface address list.
   * The UDP responder on 39217: send the advertised token, get device.json back.
   * GET /api/v1/models/storage, and instance_id in the running instances list.
+
+Measured on live hardware on 2026-09-14, and it corrected this file:
+
+  * A start that does not fit the NPU budget is not refused. It answers the same
+    200 "start loading" as any other start, reserves its units, shows up in
+    npu/status as "loading", and then disappears. No error is returned anywhere.
+    The 400 this file used to give was inferred from RUNBOOK prose. Worse, the
+    budget subtraction is not the whole constraint: with a 28 unit model resident
+    and 64 units free, three separate 50 to 55 unit models were all rolled back.
+    Polling npu/status and then proving it with a one token chat is the only way
+    to know a load actually worked.
+
+Measured on live hardware on 2026-09-16, for the numbers the chat page shows:
+
+  * timings carries cache_n, prompt_n, prompt_ms, prompt_per_second,
+    prompt_per_token_ms, predicted_n, predicted_ms, predicted_per_second and
+    predicted_per_token_ms. usage carries prompt_tokens, completion_tokens,
+    total_tokens and prompt_tokens_details.cached_tokens. A stream carries both
+    only when stream_options.include_usage asks for them, in one final chunk
+    whose choices list is empty, after the frame carrying finish_reason.
+  * A chain of thought arrives as reasoning_content, a field of its own beside
+    content, and only chat_template_kwargs.enable_thinking turns it off.
 """
 from __future__ import annotations
 
@@ -89,6 +111,10 @@ DEMO_TOKEN_DELAY = 0.012
 MIN_SLEEP = 0.05
 # Pause between download progress frames in demo mode, so the bar can be seen.
 DEMO_DOWNLOAD_STEP = 0.4
+# How many polls of npu/status a model spends in "loading" before it is either
+# running or gone. Real firmware takes tens of seconds; two polls is the same
+# shape at a speed a test can wait for.
+LOAD_POLLS = 2
 
 # Unit costs are the measured ones from CAPABILITIES.md. The capabilities list
 # is the device's own answer about what a model is for, read off live firmware
@@ -134,6 +160,22 @@ CATALOG = [
      "params": "2.48M", "size": 114_000_000, "npu_usage": 0},
 ]
 
+# What a model eats and what it produces, which the model card shows. The device
+# sends these as two scalar words per model rather than as lists: measured on
+# live firmware 2026-09-14, Qwen3-8B reports "Text" and "Text", and the embedding
+# model reports "Text" and "Vector". The other rows below follow that same one
+# word per side pattern and are inferred from the model type, not recorded.
+IO_BY_TYPE = {
+    "text generation": ("Text", "Text"),
+    "image-text-to-text": ("Image, Text", "Text"),
+    "text-to-image": ("Text", "Image"),
+    "text-to-speech": ("Text", "Audio"),
+    "asr": ("Audio", "Text"),
+    "text embedding": ("Text", "Vector"),
+    "text reranking": ("Text", "Score"),
+    "image-to-text": ("Image", "Text"),
+}
+
 # A device that has a speech model loaded next to a chat model is the ordinary
 # case, not an exotic one: the box this was checked against had an embedding,
 # an image and a text-to-speech model running alongside one chat model.
@@ -163,6 +205,14 @@ SAMPLE = (
     "several people at once is the case this silicon is worst at, and the one "
     "worth moving somewhere else. ")
 
+# A reasoning model's chain of thought arrives in reasoning_content, which is a
+# separate field from content and spends the same max_tokens budget the answer
+# needs. Measured on live firmware: Qwen3-8B asked for 60 tokens returned 200
+# characters of reasoning and an empty answer.
+REASONING = ("Checking the bandwidth math first. Bytes read per token divided "
+             "into memory bandwidth is the ceiling here, so that is the number "
+             "to give them. ")
+
 
 class FakeState:
     """One fake device's mutable state, guarded for concurrent handlers."""
@@ -191,6 +241,11 @@ class FakeState:
         self.installed = list(DEFAULT_INSTALLED if installed is None else installed)
         first = [m for m in self.installed if self._cost(m) >= 10][:1]
         self.loaded = list(first if loaded is None else loaded)
+        # Models that have been asked for and are still coming up. A pending
+        # model is already in `loaded`, because the device reserves its units
+        # the moment it accepts the start, but it reports "loading" rather than
+        # "running" and it will not answer an inference yet.
+        self.pending = {}
         self.downloads = {}
         self.guard = threading.Lock()
         self.inference = threading.Lock()
@@ -214,13 +269,52 @@ class FakeState:
     def units_used(self):
         return sum(self._cost(m) for m in self.loaded)
 
+    def _io(self, model_id):
+        """What this model eats and produces, as the device's two scalar words."""
+        row = self._row(model_id)
+        return IO_BY_TYPE.get(str(row.get("type") or "").strip().lower(),
+                              ("Text", "Text"))
+
+    def status_of(self, model_id):
+        return "loading" if model_id in self.pending else "running"
+
+    def instance_id_of(self, model_id):
+        return "fake-%s-%d" % (self.serial, abs(hash(model_id)) % 1000)
+
+    def advance_loads(self):
+        """Move every pending load one step. Called by the npu/status poll.
+
+        Measured on a real device 2026-09-14: a start that does not fit the NPU
+        budget comes back with the same 200 "start loading" as one that does,
+        shows up as loading, and then vanishes. No error is returned anywhere,
+        and polling npu/status is the only way to tell the two apart, so the
+        poll is what moves this on here too.
+        """
+        for model_id in list(self.pending):
+            job = self.pending[model_id]
+            job["polls"] -= 1
+            if job["polls"] > 0:
+                continue
+            self.pending.pop(model_id, None)
+            if job["rollback"] and model_id in self.loaded:
+                self.loaded.remove(model_id)
+
     # --------------------------------------------------------------- payloads
     def models_payload(self):
-        """OpenAIModelList. Fields track spec-8800.json's OpenAIModel."""
+        """OpenAIModelList. Fields track spec-8800.json's OpenAIModel.
+
+        input, output, desc, thinking and reasoning_levels are all on the live
+        record, read off firmware on 2026-09-14. The card reads the first three,
+        which is why they are here: without them every card field below the size
+        would be null against the fake and null is exactly what a broken card
+        looks like.
+        """
         data = []
         for model_id in self.installed:
             row = self._row(model_id)
             short = model_id.split("/")[-1]
+            wants, gives = self._io(model_id)
+            chat = "main" in (row.get("capabilities") or [])
             data.append({
                 "name": short, "fullname": model_id, "size": row["size"],
                 "toolkit_size": 0, "runtime_size": 0, "total_size": row["size"],
@@ -230,6 +324,20 @@ class FakeState:
                 "hf_repo_id": model_id, "object": "model", "created": 0,
                 "owned_by": "Model store", "status": "downloaded",
                 "download_status": "downloaded", "progress": 100.0,
+                "input": wants, "output": gives,
+                # The real desc is a long markdown blob from the model card. One
+                # honest sentence is enough to prove the field arrives and gets
+                # rendered.
+                "desc": "%s, %s parameters, %d NPU units on this device."
+                        % (short, row["params"], row["npu_usage"]),
+                "thinking": {"supported": chat, "toggleable": chat,
+                             # The device ships Qwen3-8B with reasoning on by
+                             # default. The fake leaves it off so a small
+                             # max_tokens still has room for an answer, and the
+                             # toggle is what turns it on.
+                             "enabled_by_default": False,
+                             "levels": [], "default_level": None},
+                "reasoning_levels": [],
                 "npu_usage": row["npu_usage"]})
         return {"object": "list", "data": data}
 
@@ -238,21 +346,40 @@ class FakeState:
         for offset, model_id in enumerate(self.loaded):
             # All four verified against live firmware 2026-09-13. The real
             # payload carries more per instance (created_at, capabilities,
-            # active_request_count); these are the ones Pocket reads.
+            # active_request_count); these are the ones Pocket reads. status is
+            # one of them, and it is what tells a model that is still coming up
+            # from one that will answer.
             row = self._row(model_id)
+            wants, gives = self._io(model_id)
+            status = self.status_of(model_id)
             instances.append({"model_id": model_id, "port": 9098 + offset,
                               "npu_usage": self._cost(model_id),
                               "type": row["type"],
                               "capabilities": list(row.get("capabilities") or []),
-                              "instance_id": "fake-%s-%d" % (self.serial, offset)})
+                              "status": status,
+                              "display_name": model_id.split("/")[-1],
+                              "input": wants, "output": gives,
+                              "progress": 0 if status == "loading" else 100,
+                              "instance_id": self.instance_id_of(model_id)})
         return {"running": list(self.loaded), "instances": {"running": instances}}
 
     def units_payload(self):
-        used = self.units_used()
+        """The NPU budget, and the endpoint a caller polls to watch a load.
+
+        Reading this is what advances a pending load, because on real hardware
+        this is the only place a load that is going to be rolled back can be
+        seen at all.
+        """
+        with self.guard:
+            self.advance_loads()
+            loaded = list(self.loaded)
+            models = [{"model_id": m, "npu_usage": self._cost(m),
+                       "status": self.status_of(m),
+                       "instance_id": self.instance_id_of(m)} for m in loaded]
+        used = sum(self._cost(m) for m in loaded)
         return {"npu_total": self.npu_total, "npu_used": used,
-                "npu_available": self.npu_total - used,
-                "models": [{"model_id": m, "npu_usage": self._cost(m)}
-                           for m in self.loaded]}
+                "npu_available": max(0, self.npu_total - used),
+                "models": models}
 
     def npu_status_payload(self):
         """NpuStatusResponse. temp_c and power_w are declared by the spec and
@@ -527,6 +654,7 @@ class FakeHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/models/unload_all":
             with state.guard:
                 state.loaded = []
+                state.pending = {}
             return self._send(200, {"removed_container_ids": []})
 
         prefix = "/api/v1/models/"
@@ -571,13 +699,16 @@ class FakeHandler(BaseHTTPRequestHandler):
             if model_id in state.loaded:
                 return self._send(200, {"message": "%s already running" % model_id,
                                         "progress": 100})
-            cost = state._cost(model_id)
-            if state.units_used() + cost > state.npu_total:
-                return self._send(400, {
-                    "code": 400, "msg": "Error starting model.",
-                    "detail": "needs %d NPU units, only %d free"
-                              % (cost, state.npu_total - state.units_used())})
+            # Measured 2026-09-14 on a real device: a start that does not fit
+            # the remaining budget is accepted with this same 200, reserves its
+            # units, sits in npu/status as "loading", and then disappears. No
+            # error is ever returned. This file used to answer a 400 with "needs
+            # N units, only M free", which was inferred from RUNBOOK prose and
+            # is not what the hardware does, so a caller written against it
+            # would think an unfit load had been refused when it had not.
+            over = state.units_used() + state._cost(model_id) > state.npu_total
             state.loaded.append(model_id)
+            state.pending[model_id] = {"polls": LOAD_POLLS, "rollback": over}
         return self._send(200, {"message": "start loading %s" % model_id, "progress": 0})
 
     def _stop(self, model_id):
@@ -587,6 +718,7 @@ class FakeHandler(BaseHTTPRequestHandler):
                 return self._send(400, {"code": 400, "msg": "Error stopping model.",
                                         "detail": "%s is not running" % model_id})
             state.loaded.remove(model_id)
+            state.pending.pop(model_id, None)
         return self._send(200, {"removed_container_ids": ["fake%s" % abs(hash(model_id))]})
 
     def _download(self, model_id):
@@ -656,6 +788,15 @@ class FakeHandler(BaseHTTPRequestHandler):
             return self._send(404, {"error": {
                 "code": 404, "message": '"%s" is not loaded.' % model_id,
                 "type": "model_not_found"}})
+        if model_id in state.pending:
+            # UNVERIFIED body: a model that is still coming up has been measured
+            # to refuse inference, which is why a load is only proven by a chat
+            # succeeding and not by npu/status saying running, but the exact
+            # error the gateway returns for it has not been captured. The
+            # recorded not-loaded shape is the nearest thing that is real.
+            return self._send(404, {"error": {
+                "code": 404, "message": '"%s" is not loaded.' % model_id,
+                "type": "model_not_found"}})
 
         if not state.inference.acquire(blocking=False):
             # One inference at a time. This is the collision every caller hits
@@ -673,10 +814,64 @@ class FakeHandler(BaseHTTPRequestHandler):
         finally:
             state.inference.release()
 
-    def _tokens(self, body):
-        want = int(body.get("max_tokens") or 64)
+    @staticmethod
+    def _thinking(body):
+        """Whether this request asked for a chain of thought.
+
+        Only chat_template_kwargs.enable_thinking is read, because that is the
+        only knob the runtime actually honours: the gateway's own OpenAPI
+        document declares a top level enable_thinking as well, and a request
+        sending it gets reasoning back anyway. Measured 2026-09-16.
+        """
+        kwargs = body.get("chat_template_kwargs")
+        if isinstance(kwargs, dict) and "enable_thinking" in kwargs:
+            return bool(kwargs["enable_thinking"])
+        return False
+
+    def _plan(self, body):
+        """(reasoning tokens, answer tokens, hit the cap).
+
+        Reasoning is charged against max_tokens before the answer is, which is
+        why a reasoning model with a small cap answers nothing at all, and why
+        the fake has to spend the budget in the same order: a stats bar that
+        counted only the answer would never add up to what the device charged.
+        """
+        want = max(1, int(body.get("max_tokens") or 64))
+        # TOKEN_CAP is where this fake stops of its own accord, which stands in
+        # for a model reaching the end of what it had to say. Asking for more
+        # than that gets a "stop"; asking for less gets a "length", the same way
+        # the real gateway answers.
+        budget = min(want, TOKEN_CAP)
+        reason = []
+        if self._thinking(body):
+            reason = [word + " " for word in REASONING.split()][:budget]
         words = SAMPLE.split()
-        return [words[i % len(words)] + " " for i in range(max(1, min(want, TOKEN_CAP)))]
+        answer = [words[i % len(words)] + " "
+                  for i in range(max(0, budget - len(reason)))]
+        return reason, answer, len(reason) + len(answer) >= want
+
+    def _timings(self, body, reason, answer, elapsed):
+        """The gateway's timings block, with every field the real one carries."""
+        prompt_n = self._prompt_tokens(body)
+        predicted_n = max(1, len(reason) + len(answer))
+        elapsed = max(elapsed, 0.001)
+        # API.md records ~28 tok/s prompt processing on real firmware.
+        return {"cache_n": 0,
+                "prompt_n": prompt_n,
+                "prompt_ms": round(prompt_n / PREFILL_TOK_S * 1000, 1),
+                "prompt_per_second": PREFILL_TOK_S,
+                "prompt_per_token_ms": round(1000 / PREFILL_TOK_S, 4),
+                "predicted_n": predicted_n,
+                "predicted_ms": round(elapsed * 1000, 3),
+                "predicted_per_second": round(predicted_n / elapsed, 2),
+                "predicted_per_token_ms": round(elapsed * 1000 / predicted_n, 2)}
+
+    @staticmethod
+    def _usage(timings):
+        prompt_n, predicted_n = timings["prompt_n"], timings["predicted_n"]
+        return {"prompt_tokens": prompt_n, "completion_tokens": predicted_n,
+                "total_tokens": prompt_n + predicted_n,
+                "prompt_tokens_details": {"cached_tokens": timings["cache_n"]}}
 
     @staticmethod
     def _prompt_tokens(body):
@@ -708,9 +903,9 @@ class FakeHandler(BaseHTTPRequestHandler):
 
     def _chat_once(self, body, model_id):
         state = self.state
-        tokens = self._tokens(body)
+        reason, answer, hit_cap = self._plan(body)
         started = time.time()
-        for index in range(len(tokens)):
+        for index in range(len(reason) + len(answer)):
             self._pace(started, index + 1)
             if state.request_ceiling and time.time() - started > state.request_ceiling:
                 # The gateway ceiling: measured at 222.3s on real firmware after
@@ -721,25 +916,23 @@ class FakeHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b"{}")
                 return None
-        text = "".join(tokens).strip()
-        elapsed = max(time.time() - started, 0.001)
-        prompt_n = self._prompt_tokens(body)
-        # API.md records ~28 tok/s prompt processing on real firmware.
-        prompt_ms = round(prompt_n / PREFILL_TOK_S * 1000, 1)
+        timings = self._timings(body, reason, answer, time.time() - started)
+        message = {"role": "assistant", "content": "".join(answer).strip()}
+        if reason:
+            # Non-streamed, the chain of thought comes back beside the answer in
+            # its own field rather than wrapped in tags inside the content.
+            message["reasoning_content"] = "".join(reason).strip()
         return self._send(200, {
             "id": "chatcmpl-fake-%d" % int(started),
             "object": "chat.completion", "created": int(started), "model": model_id,
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": text}}],
-            "usage": {"prompt_tokens": prompt_n, "completion_tokens": len(tokens),
-                      "total_tokens": prompt_n + len(tokens),
-                      "prompt_tokens_details": {"cached_tokens": 0}},
+            "system_fingerprint": "fake-0",
+            # "length" when the answer ran into max_tokens, which on a reasoning
+            # model with a modest cap is the ordinary case and not a failure.
+            "choices": [{"index": 0, "finish_reason": "length" if hit_cap else "stop",
+                         "message": message}],
+            "usage": self._usage(timings),
             # Real gateways return a timings block; tiiny-bench reads it.
-            "timings": {"prompt_n": prompt_n, "prompt_ms": prompt_ms,
-                        "prompt_per_second": PREFILL_TOK_S,
-                        "predicted_n": len(tokens),
-                        "predicted_per_second": round(len(tokens) / elapsed, 2),
-                        "predicted_per_token_ms": round(elapsed * 1000 / len(tokens), 2)}})
+            "timings": timings})
 
     def _chat_stream(self, body, model_id):
         state = self.state
@@ -755,17 +948,36 @@ class FakeHandler(BaseHTTPRequestHandler):
                     "created": created, "model": model_id,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
+        reason, answer, hit_cap = self._plan(body)
+        options = body.get("stream_options")
+        want_usage = bool(isinstance(options, dict) and options.get("include_usage"))
         try:
-            self._sse(frame({"role": "assistant", "content": ""}))
-            # Reasoning models split output: chain of thought lands in
-            # reasoning_content and counts against max_tokens.
-            self._sse(frame({"reasoning_content": "Checking the bandwidth math. "}))
+            # The opening frame carries a null content, not an empty string.
+            # Measured on live firmware, and it is the shape that catches a
+            # renderer appending the delta without checking it.
+            self._sse(frame({"role": "assistant", "content": None}))
             started = time.time()
-            tokens = self._tokens(body)
-            for index, token in enumerate(tokens):
+            # Reasoning models split output: the chain of thought lands in
+            # reasoning_content, arrives before the answer, and counts against
+            # max_tokens.
+            for index, token in enumerate(reason):
                 self._pace(started, index + 1)
+                self._sse(frame({"reasoning_content": token}))
+            for index, token in enumerate(answer):
+                self._pace(started, len(reason) + index + 1)
                 self._sse(frame({"content": token}))
-            self._sse(frame({}, finish="stop"))
+            self._sse(frame({}, finish="length" if hit_cap else "stop"))
+            if want_usage:
+                # With stream_options.include_usage the gateway adds one last
+                # chunk carrying timings and usage, and its choices list is
+                # empty. Without it there is no such chunk at all, which is why
+                # a caller that wants the numbers has to ask.
+                timings = self._timings(body, reason, answer, time.time() - started)
+                self._sse({"id": "chatcmpl-fake-%d" % created,
+                           "object": "chat.completion.chunk", "created": created,
+                           "model": model_id, "system_fingerprint": "fake-0",
+                           "choices": [], "timings": timings,
+                           "usage": self._usage(timings)})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
