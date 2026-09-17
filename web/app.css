@@ -268,10 +268,25 @@ textarea { resize: vertical; min-height: 42px; width: 100%; }
 .checks { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 11px; }
 
 /* ── chat ─────────────────────────────────────────────────────────── */
+/* Three columns like the AINode command center: the model card and the
+   conversation list on the left, the conversation in the middle, the running
+   instances and the load panel on the right. The palette stays Pocket's. */
 #view-chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 #view-chat[hidden] { display: none; }
-.chat-bar { display: flex; align-items: flex-end; gap: 16px; margin-bottom: 13px; }
-.chat-bar .muted { padding-bottom: 4px; }
+.chat-grid {
+  flex: 1; min-height: 0; display: grid; gap: 14px;
+  grid-template-columns: 272px minmax(0, 1fr) 296px;
+}
+.chat-side, .chat-rail { min-height: 0; overflow-y: auto; }
+.chat-side .card, .chat-rail .card { padding: 14px 15px; margin-bottom: 12px; }
+.chat-main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+
+.chat-bar { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+.chat-bar .muted { padding-bottom: 5px; }
+.chat-bar label.grow { flex: 1; min-width: 220px; }
+.chat-bar select { min-width: 210px; max-width: 320px; }
+.chat-bar input[type="number"] { min-width: 0; width: 86px; }
+.chat-bar input[type="text"] { min-width: 0; width: 100%; }
 /* A real button, so it is reachable by keyboard, that reads as a link: the
    Models page is a view in this app and not a URL to navigate to. */
 .linklike {
@@ -280,14 +295,17 @@ textarea { resize: vertical; min-height: 42px; width: 100%; }
 }
 .linklike:hover { color: var(--green-bright); }
 .chat-log {
-  flex: 1; min-height: 340px; overflow-y: auto;
+  flex: 1; min-height: 300px; overflow-y: auto;
   background: var(--card); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 16px 18px;
 }
 .chat-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; text-align: center; gap: 14px; }
+/* Same trap as #view-chat above: a class that sets display beats the
+   browser's own [hidden] rule, so the placeholder has to be told twice. */
+.chat-empty[hidden] { display: none; }
 .chat-empty-mark { font-size: 34px; color: var(--green-dim); }
 .chat-empty p { max-width: 430px; color: var(--ink-2); font-size: 12px; line-height: 1.7; }
-.turn { margin-bottom: 18px; }
+.turn { margin-bottom: 20px; }
 .turn-who {
   font-family: var(--mono); font-size: 9.5px; letter-spacing: 1.3px;
   text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px;
@@ -296,14 +314,176 @@ textarea { resize: vertical; min-height: 42px; width: 100%; }
 .turn.user .turn-who { color: var(--cyan); }
 .turn.assistant .turn-who { color: var(--green); }
 .turn-body { font-size: 13px; line-height: 1.72; white-space: pre-wrap; }
+/* Rendered markdown brings its own paragraphs, so pre-wrap would double every
+   blank line. Only the plain user turn keeps it. */
+.turn-body.turn-md { white-space: normal; }
+.turn-md p { margin: 0 0 9px; }
+.turn-md p:last-child { margin-bottom: 0; }
+.turn-md ul, .turn-md ol { margin: 0 0 10px; padding-left: 22px; }
+.turn-md li { margin: 2px 0; }
+.turn-md strong { color: #f0f0f0; font-weight: 650; }
+.turn-md em { color: var(--ink); font-style: italic; }
+.turn-md del { color: var(--ink-3); }
+.chat-h { margin: 15px 0 7px; font-weight: 650; letter-spacing: -0.2px; color: var(--ink); }
+.chat-h:first-child { margin-top: 0; }
+h2.chat-h { font-size: 16px; }
+h3.chat-h { font-size: 14.5px; }
+h4.chat-h, h5.chat-h { font-size: 13px; color: var(--green); }
+.chat-link { color: var(--green); border-bottom: 1px solid transparent; word-break: break-all; }
+.chat-link:hover { border-bottom-color: var(--green); }
+
+.inline-code {
+  background: rgba(118, 185, 0, .1); color: var(--green-bright);
+  padding: 1px 5px; border-radius: 4px; font-family: var(--mono);
+  font-size: .9em; border: 1px solid rgba(118, 185, 0, .15);
+}
+.code-block-wrapper {
+  margin: 11px 0; border-radius: var(--radius-sm); overflow: hidden;
+  background: #050505; border: 1px solid var(--border);
+}
+.code-block-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 12px; background: var(--card); border-bottom: 1px solid var(--border);
+}
+.code-block-lang {
+  font-family: var(--mono); font-size: 10px; color: var(--green);
+  letter-spacing: 1px; text-transform: lowercase; font-weight: 600;
+}
+.code-copy-btn {
+  background: transparent; border: 1px solid var(--border-hover); color: var(--ink-2);
+  font-family: var(--mono); font-size: 10px; padding: 3px 9px;
+  border-radius: 4px; cursor: pointer; transition: all .14s ease;
+}
+.code-copy-btn:hover { color: var(--green); border-color: var(--green-dim); background: rgba(118, 185, 0, .08); }
+.code-copy-btn.copied { color: var(--green); border-color: var(--green); }
+.code-block {
+  margin: 0; padding: 12px 14px; overflow-x: auto;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
+  color: #d0d0d0; background: transparent;
+}
+.code-block code { font: inherit; color: inherit; white-space: pre; display: block; }
+/* One in-house tokeniser, Pocket's colours. Nothing is highlighted for a
+   language the tokeniser does not know: the text is escaped and left alone. */
+.tok-com { color: var(--ink-3); font-style: italic; }
+.tok-str { color: var(--cyan); }
+.tok-kw { color: var(--green-bright); }
+.tok-fn { color: #c9d98a; }
+.tok-num { color: var(--amber); }
+.tok-key { color: var(--green); }
+.tok-var { color: #7fd1ff; }
+.tok-tag { color: var(--green-bright); }
+.tok-attr { color: var(--amber); }
+
+/* The stats bar belongs to the message that earned it, so it is written into
+   the turn and saved with the conversation rather than overwritten by the
+   next answer. This is a benchmarking utility: every reply carries numbers. */
+.stats-bar {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
+  padding-top: 9px; border-top: 1px solid var(--border);
+}
+.stat-chip {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .4px;
+  color: var(--ink-3); background: #0d0d0d; border: 1px solid var(--border);
+  border-radius: 20px; padding: 3px 9px; white-space: nowrap;
+}
+.stat-chip b { color: var(--green); font-weight: 600; margin-left: 5px; }
+.stat-chip.warn { border-color: #6a5200; }
+.stat-chip.warn b { color: var(--amber); }
+
 .turn-think {
-  margin-top: 9px; padding: 9px 11px; border-left: 2px solid var(--border-hover);
-  background: #0d0d0d; font-size: 11px; color: var(--ink-3); line-height: 1.6;
-  white-space: pre-wrap;
+  margin: 0 0 10px; border-left: 2px solid var(--border-hover);
+  background: #0d0d0d; border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+.turn-think > summary {
+  cursor: pointer; list-style: none; padding: 7px 11px;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 1.2px;
+  text-transform: uppercase; color: var(--ink-3);
+}
+.turn-think > summary::-webkit-details-marker { display: none; }
+.turn-think > summary::before { content: '▸ '; color: var(--green-dim); }
+.turn-think[open] > summary::before { content: '▾ '; }
+.turn-think > summary:hover { color: var(--ink-2); }
+.turn-think-body {
+  padding: 0 11px 10px; font-size: 11px; color: var(--ink-3);
+  line-height: 1.65; white-space: pre-wrap; max-height: 260px; overflow-y: auto;
 }
 .turn-err { color: var(--red); font-size: 12px; }
-.chat-compose { display: flex; gap: 10px; align-items: flex-end; margin-top: 13px; }
+.chat-compose { display: flex; gap: 10px; align-items: flex-end; margin-top: 12px; }
 .chat-compose textarea { flex: 1; }
+
+/* ── chat: model card and conversations ───────────────────────────── */
+.card-note { font-size: 11px; color: var(--ink-3); line-height: 1.6; margin-top: 9px; }
+.model-card .kv { margin-bottom: 2px; }
+.model-card .kv dd { word-break: break-word; }
+.model-desc {
+  margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--ink-2); line-height: 1.6;
+  max-height: 96px; overflow-y: auto;
+}
+.model-where { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.model-where-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.model-where-row .meta { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.card-link { display: inline-block; margin-top: 10px; font-size: 11px; }
+
+.conv-list { display: flex; flex-direction: column; gap: 3px; max-height: 260px; overflow-y: auto; }
+.conv-item {
+  display: flex; align-items: center; gap: 8px; padding: 7px 9px;
+  border: 1px solid transparent; border-radius: var(--radius-sm); cursor: pointer;
+}
+.conv-item:hover { background: var(--card-hover); border-color: var(--border); }
+.conv-item.active { background: rgba(118, 185, 0, .1); border-color: var(--green-dim); }
+.conv-item-content { min-width: 0; flex: 1; }
+.conv-item-title { font-size: 12px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item-date { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); margin-top: 2px; }
+.conv-delete {
+  background: none; border: 0; color: var(--ink-3); font-size: 15px;
+  line-height: 1; cursor: pointer; padding: 2px 4px;
+}
+.conv-delete:hover { color: var(--red); }
+.conv-empty { font-size: 11.5px; color: var(--ink-3); padding: 8px 2px; }
+
+/* ── chat: instances rail ─────────────────────────────────────────── */
+.rail-device { margin-bottom: 11px; }
+.rail-device:last-child { margin-bottom: 0; }
+.rail-device-head {
+  display: flex; align-items: center; gap: 7px; font-family: var(--mono);
+  font-size: 10.5px; color: var(--ink-2); margin-bottom: 5px;
+}
+.rail-device-head b { margin-left: auto; color: var(--ink); font-weight: 600; }
+.instance-card {
+  background: #0d0d0d; border: 1px solid var(--border);
+  border-left: 3px solid var(--green); border-radius: var(--radius-sm);
+  padding: 10px 11px; margin-top: 9px;
+}
+.instance-card.loading { border-left-color: var(--amber); }
+.instance-model {
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.instance-meta {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin-top: 6px; font-family: var(--mono); font-size: 9.5px; color: var(--ink-3);
+}
+.instance-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+.instance-status {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 1px;
+  text-transform: uppercase; color: var(--green);
+}
+.instance-status.loading { color: var(--amber); }
+.instance-status.stopped { color: var(--ink-3); }
+.instance-delete {
+  background: none; border: 1px solid var(--border-hover); color: var(--ink-2);
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 1px;
+  text-transform: uppercase; padding: 3px 9px; border-radius: 4px; cursor: pointer;
+}
+.instance-delete:hover { color: var(--red); border-color: #5c1616; }
+.instance-delete:disabled { opacity: .4; cursor: not-allowed; }
+.instances-empty { font-size: 11.5px; color: var(--ink-3); padding: 8px 2px; }
+.chat-rail label { margin-bottom: 9px; }
+.chat-rail select { min-width: 0; width: 100%; }
+.load-hint { font-size: 10.5px; color: var(--ink-3); line-height: 1.6; margin-bottom: 10px; }
+.load-hint.warn { color: var(--amber); }
+.chat-rail .btn { width: 100%; }
 
 /* ── misc ─────────────────────────────────────────────────────────── */
 .empty { color: var(--ink-3); font-size: 12px; padding: 14px 0; }
@@ -319,4 +499,41 @@ textarea { resize: vertical; min-height: 42px; width: 100%; }
 @media (max-width: 1100px) {
   .summary { grid-template-columns: repeat(2, 1fr); }
   .device-grid { grid-template-columns: 1fr; }
+  .chat-grid { grid-template-columns: 240px minmax(0, 1fr); }
+  .chat-rail { grid-column: 1 / -1; }
+  .chat-rail .card { margin-bottom: 0; }
+}
+
+/* Under 900px the three columns become one and the page scrolls as a whole:
+   a fixed-height chat log inside a stacked column leaves no room for the card
+   or the rail. */
+@media (max-width: 900px) {
+  .chat-grid { grid-template-columns: 1fr; flex: none; }
+  #view-chat { height: auto; }
+  .chat-side, .chat-rail { overflow: visible; }
+  .chat-log { flex: none; height: 58vh; }
+  .chat-bar select { max-width: none; }
+}
+
+/* Under 700px the sidebar stops being a column. A fixed 240px rail leaves a
+   phone-width window nothing to render the view in: pre-existing, and the
+   stacked chat columns are what made it obvious. */
+@media (max-width: 700px) {
+  .shell { flex-direction: column; height: auto; min-height: 100vh; overflow: visible; }
+  .sidebar {
+    width: auto; flex: none; flex-direction: row; flex-wrap: wrap;
+    align-items: center; border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  .sidebar-header { padding: 12px 16px; border-bottom: 0; }
+  .nav { flex-direction: row; flex-wrap: wrap; padding: 10px 12px; }
+  .nav-item { border-left: 0; border-bottom: 3px solid transparent; padding: 7px 11px; }
+  .nav-item.active { border-left-color: transparent; border-bottom-color: var(--green); }
+  .sidebar-foot { margin: 0 0 0 auto; padding: 10px 16px; border-top: 0; }
+  .endpoint-mini { display: none; }
+  .main { min-height: 0; }
+  .topbar { height: auto; flex: none; flex-wrap: wrap; gap: 8px 14px; padding: 10px 16px; }
+  .topbar-stats { margin-left: 0; gap: 14px; }
+  .scroll { overflow-y: visible; padding: 14px 16px 22px; }
+  .chat-log { height: 62vh; }
+  .summary { grid-template-columns: 1fr; }
 }

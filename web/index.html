@@ -26,7 +26,7 @@
         <div class="endpoint-mini-label">Endpoint</div>
         <code id="mini-endpoint">http://127.0.0.1:8430/v1</code>
       </div>
-      <div class="sidebar-version" id="version">v0.1.2</div>
+      <div class="sidebar-version" id="version">v0.1.3</div>
     </div>
   </aside>
 
@@ -123,24 +123,68 @@
 
       <!-- ── Chat ─────────────────────────────────────────────────── -->
       <section class="view" id="view-chat" hidden>
-        <div class="chat-bar">
-          <label>Model<select id="chat-model"></select></label>
-          <span class="muted" id="chat-route"></span>
-          <label class="check"><input type="checkbox" id="chat-stream" checked>Stream</label>
-        </div>
-        <div class="chat-log" id="chat-log">
-          <div class="chat-empty">
-            <div class="chat-empty-mark">◈</div>
-            <p>This page talks to <code>/v1/chat/completions</code> on this app,
-               the same endpoint your own clients use. The picker lists only
-               models that can chat and are loaded right now, so a speech or
-               embedding model never turns up here.</p>
+        <div class="chat-grid">
+
+          <aside class="chat-side">
+            <div class="card model-card" id="model-card"></div>
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">Conversations</div>
+                <button class="btn small" id="new-chat" type="button">New chat</button>
+              </div>
+              <div class="conv-list" id="conversation-list"></div>
+            </div>
+          </aside>
+
+          <div class="chat-main">
+            <div class="chat-bar">
+              <label>Model<select id="chat-model"></select></label>
+              <label>Temperature<input id="chat-temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
+              <label>Max tokens<input id="chat-max-tokens" type="number" min="16" max="8192" step="16" value="700"></label>
+              <label class="check"><input type="checkbox" id="chat-stream" checked>Stream</label>
+              <label class="check"><input type="checkbox" id="chat-thinking" checked>Thinking</label>
+            </div>
+            <div class="chat-bar">
+              <label class="grow">System prompt<input id="chat-system" type="text"
+                     placeholder="optional, sent ahead of the conversation"></label>
+              <span class="muted" id="chat-route"></span>
+            </div>
+            <div class="chat-log" id="chat-log">
+              <div class="chat-empty" id="chat-empty">
+                <div class="chat-empty-mark">◈</div>
+                <p>This page talks to <code>/api/chat</code> on this app, which routes to
+                   <code>/v1/chat/completions</code> on a device and hands back the same
+                   numbers the bench measures. The picker lists only models that can chat
+                   and are loaded right now, so a speech or embedding model never turns
+                   up here.</p>
+              </div>
+              <div id="chat-turns"></div>
+            </div>
+            <form class="chat-compose" id="chat-form">
+              <textarea id="chat-input" rows="2" placeholder="Ask the fleet something..."></textarea>
+              <button class="btn primary" id="chat-send" type="submit">Send</button>
+            </form>
           </div>
+
+          <aside class="chat-rail">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">Instances</div>
+                <span class="muted" id="instances-count"></span>
+              </div>
+              <div id="instances-devices"></div>
+              <div id="instances-list"></div>
+            </div>
+            <div class="card">
+              <div class="card-header"><div class="card-title">Load a model</div></div>
+              <label>Device<select id="load-device"></select></label>
+              <label>Model<select id="load-model"></select></label>
+              <p class="load-hint" id="load-hint"></p>
+              <button class="btn primary" id="load-btn" type="button">Load</button>
+            </div>
+          </aside>
+
         </div>
-        <form class="chat-compose" id="chat-form">
-          <textarea id="chat-input" rows="2" placeholder="Ask the fleet something..."></textarea>
-          <button class="btn primary" id="chat-send" type="submit">Send</button>
-        </form>
       </section>
 
       <!-- ── Bench ────────────────────────────────────────────────── -->
@@ -183,7 +227,7 @@
     </div>
 
     <footer class="footer">
-      <span>AINode Pocket <span id="footer-version">0.1.2</span></span>
+      <span>AINode Pocket <span id="footer-version">0.1.3</span></span>
       <span class="footer-right">
         <svg class="texas" viewBox="0 0 24 24" width="14" height="14"
              fill="currentColor" aria-hidden="true"
