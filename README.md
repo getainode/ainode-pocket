@@ -430,7 +430,7 @@ python3 ainode-pocket --selfcheck                  offline check, no hardware
 python3 -m unittest discover -s tests
 ```
 
-218 tests, no hardware and no network beyond loopback. They run against a fake
+224 tests, no hardware and no network beyond loopback. They run against a fake
 device that reproduces the recorded response shapes, and each assertion in
 `tests/test_fake.py` names the artefact its shape came from. The fake also
 reproduces both failures that matter, so the code has actually met them: the
@@ -529,7 +529,7 @@ pocket/server.py       the HTTP server, the JSON API, static assets
 pocket/bench.py        tiiny-bench, embedded
 pocket/fake.py         a fake device built from the recorded artefacts
 web/                   the page: one html, one css, one js
-tests/                 218 tests, no hardware
+tests/                 224 tests, no hardware
 manifests/             the tiinyapp.farm manifest
 ```
 
