@@ -5,4 +5,4 @@ ships as a tiinyapp.farm app that has to run on whatever Python the user already
 has.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
