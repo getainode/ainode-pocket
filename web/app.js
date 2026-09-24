@@ -135,6 +135,14 @@ function paintTop() {
 }
 
 function paintOverview() {
+  // The device grid rebuilds from scratch here, which would blow away
+  // whatever someone is mid-typing into an unlock password field -- the
+  // 6-second poll firing mid-keystroke reads as "the page keeps refreshing
+  // and eating my password." Skip the rebuild for this tick while that
+  // field has focus; the summary strip above still updates every time.
+  if (document.activeElement && document.activeElement.classList.contains('unlock-pw')) {
+    return;
+  }
   var summary = state.summary;
   var strip = $('#summary');
   strip.textContent = '';
@@ -2094,9 +2102,11 @@ function boot() {
       send(question, parseInt(params.get('max'), 10) || 0);
     }
   });
-  setInterval(function () {
-    if (!chatBusy && document.visibilityState === 'visible') refresh();
-  }, 6000);
+  // No background poll here on purpose: the page loads state once, and the
+  // Refresh button (wired above) is the only thing that fetches again after
+  // that. A silent timer refreshing every few seconds is what wiped a
+  // half-typed unlock password out from under someone -- the fix isn't a
+  // smarter timer, it's not having one.
 }
 
 document.addEventListener('DOMContentLoaded', boot);
