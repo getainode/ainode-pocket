@@ -410,6 +410,8 @@ h4.chat-h, h5.chat-h { font-size: 13px; color: var(--green); }
 .turn-err { color: var(--red); font-size: 12px; }
 /* Under an answer that did arrive, rather than in place of it. */
 .turn-err-tail { margin-top: 9px; }
+.unlock-row { display: flex; gap: 8px; margin-top: 10px; }
+.unlock-row .unlock-pw { min-width: 0; flex: 1; padding: 5px 10px; font-size: 11px; }
 .chat-compose { display: flex; gap: 10px; align-items: flex-end; margin-top: 12px; }
 .chat-compose textarea { flex: 1; }
 

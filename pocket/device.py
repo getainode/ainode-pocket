@@ -59,6 +59,7 @@ KEY_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 # surface behind openai. Both verified against a live device.
 GATEWAY_VHOST = "p8800.api.tiiny"
 OPENAI_VHOST = "openai.api.tiiny"
+AUTH_VHOST = "auth.api.tiiny"
 
 TRANSPORT_DIRECT = "direct"
 TRANSPORT_VHOST = "vhost"
@@ -944,6 +945,36 @@ def tiinyos_keys():
             if match not in seen:
                 seen.append(match)
     return seen
+
+
+def account_auth_key(address, serial, password):
+    """The device's own static API key, straight from the box, no TiinyOS.
+
+    POST /api/v1/account/auth (password + serial), Host: auth.api.tiiny, does
+    two things at once on a real device: it unlocks /data if it was locked,
+    and its `auth_key` field IS the static key this whole module calls just
+    "key" -- the same one TiinyOS reads out of its own local storage.
+    Confirmed 2026-09-24 against a live device: that value works unmodified
+    as Authorization: Bearer against the gateway. Full writeup and the trail
+    that found it: ~/code/tiiny/tools/README-unlock.md.
+
+    Returns "" rather than raising on any failure (wrong password, box
+    unreachable, unexpected body) -- callers already treat an empty key as
+    "try something else", so this fits the existing find_key() contract
+    instead of adding a new failure shape for callers to handle.
+    """
+    body = json.dumps({"password": password, "device_id": serial}).encode()
+    req = urllib.request.Request(
+        "http://%s/api/v1/account/auth" % address, data=body, method="POST",
+        headers={"Content-Type": "application/json", "Host": AUTH_VHOST,
+                 "x-device-id": serial, "accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            out = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            ValueError, OSError):
+        return ""
+    return (out.get("auth_key") or "").strip()
 
 
 def find_key(verify=None):

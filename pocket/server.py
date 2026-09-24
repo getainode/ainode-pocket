@@ -482,6 +482,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.instance_unload(payload)
             if path == "/api/devices":
                 return self.add_device(payload)
+            if path == "/api/devices/unlock":
+                return self.unlock_device(payload)
             if path == "/api/discover":
                 return self.discover(payload)
             if path in ("/api/models/load", "/api/models/unload",
@@ -816,6 +818,13 @@ class Handler(BaseHTTPRequestHandler):
             # local storage holds several UUIDs and only one is live.
             key = device_mod.find_key(
                 verify=device_mod.key_checker(address, gateway_url or None))
+        password = (payload.get("password") or "").strip()
+        if not key and password and address:
+            # A box that never had TiinyOS run against it has no local-storage
+            # key to find, locked or not. Its own account API hands one over
+            # directly -- see ~/code/tiiny/tools/README-unlock.md.
+            resolved_id = device_mod.identity(device_mod.probe(address), address)
+            key = device_mod.account_auth_key(address, resolved_id, password)
         try:
             dev = self.fleet.register(address, key=key or None,
                                      name=payload.get("name"),
@@ -835,6 +844,23 @@ class Handler(BaseHTTPRequestHandler):
                                               "addresses": dev.addresses,
                                               "route": dev.route_label},
                                     "telemetry": probe})
+
+    def unlock_device(self, payload):
+        """Get a fresh key for a registered device, e.g. after it relocked.
+
+        Same account-API call add_device tries on first registration, but
+        for a box that's already in the fleet and just needs a new key --
+        the "Unlock" action on a red card, not a re-add.
+        """
+        device_id = (payload.get("id") or "").strip()
+        password = (payload.get("password") or "").strip()
+        if not device_id or not password:
+            return self.send_json(400, {"error": {"message": "id and password are required"}})
+        try:
+            telemetry = self.fleet.unlock(device_id, password)
+        except NoDevice as exc:
+            return self.send_json(400, {"error": {"message": str(exc)}})
+        return self.send_json(200, {"telemetry": telemetry})
 
     def discover(self, payload):
         """Find devices.

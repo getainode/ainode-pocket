@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests import FakeFleetCase
 from pocket import bench as bench_mod
+from pocket import device as device_mod
 from pocket import server as server_mod
 
 
@@ -175,6 +176,49 @@ class TestDeviceApi(ServerCase):
         status, payload = self.request("/api/devices", "POST", {})
         self.assertEqual(status, 400)
         self.assertIn("address is required", payload["error"]["message"])
+
+    def test_add_device_falls_back_to_a_password_when_no_key_is_found(self):
+        from pocket import fake as fake_mod
+        extra = fake_mod.FakeDevice(index=8).start()
+        self.addCleanup(extra.stop)
+        real_find = device_mod.find_key
+        real_auth = device_mod.account_auth_key
+        device_mod.find_key = lambda verify=None: ""
+        device_mod.account_auth_key = lambda address, serial, password: extra.key
+        self.addCleanup(lambda: setattr(device_mod, "find_key", real_find))
+        self.addCleanup(lambda: setattr(device_mod, "account_auth_key", real_auth))
+        status, payload = self.request("/api/devices", "POST", {
+            "address": extra.host, "password": "x",
+            "gateway": extra.base, "mgmt": extra.base, "discovery": extra.base})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["telemetry"]["online"])
+
+    def test_unlock_adopts_the_key_the_account_api_returns(self):
+        # The "Unlock" button on a red card: no key or password known yet,
+        # just what the account API hands back for this password.
+        real = device_mod.account_auth_key
+        device_mod.account_auth_key = lambda address, serial, password: self.fake.key
+        self.addCleanup(lambda: setattr(device_mod, "account_auth_key", real))
+        self.fleet.devices[self.fake.serial].key = "stale-key"
+        status, payload = self.request("/api/devices/unlock", "POST",
+                                      {"id": self.fake.serial, "password": "x"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["telemetry"]["online"])
+        self.assertEqual(self.fleet.devices[self.fake.serial].key, self.fake.key)
+
+    def test_unlock_requires_id_and_password(self):
+        status, payload = self.request("/api/devices/unlock", "POST", {"id": self.fake.serial})
+        self.assertEqual(status, 400)
+        self.assertIn("required", payload["error"]["message"])
+
+    def test_unlock_a_wrong_password_is_a_clean_400(self):
+        real = device_mod.account_auth_key
+        device_mod.account_auth_key = lambda address, serial, password: ""
+        self.addCleanup(lambda: setattr(device_mod, "account_auth_key", real))
+        status, payload = self.request("/api/devices/unlock", "POST",
+                                      {"id": self.fake.serial, "password": "wrong"})
+        self.assertEqual(status, 400)
+        self.assertIn("password", payload["error"]["message"])
 
 
 class TestModelActions(ServerCase):

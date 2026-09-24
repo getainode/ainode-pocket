@@ -169,6 +169,38 @@ function npuTotals() {
   return total ? used + ' / ' + total : '-';
 }
 
+function unlockForm(device) {
+  // A box that rebooted comes back locked -- /data unmounted, the gateway
+  // answering an instant error, no TiinyOS needed to fix it. One password,
+  // sent straight to the device's own account API. See
+  // ~/code/tiiny/tools/README-unlock.md for what this call actually does.
+  var wrap = el('div', 'unlock-row');
+  var input = document.createElement('input');
+  input.type = 'password';
+  input.placeholder = 'Tiiny password, to unlock';
+  input.className = 'unlock-pw';
+  var button = el('button', 'btn small', 'Unlock');
+  var go = function () {
+    var password = input.value;
+    if (!password) return;
+    button.disabled = true;
+    api('/api/devices/unlock', { method: 'POST',
+      body: { id: device.id, password: password } })
+      .then(function () {
+        input.value = '';
+        toast('unlocked ' + device.name);
+        refresh();
+      })
+      .catch(function (err) { toast(err.message, true); })
+      .then(function () { button.disabled = false; });
+  };
+  input.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') go(); });
+  button.onclick = go;
+  wrap.appendChild(input);
+  wrap.appendChild(button);
+  return wrap;
+}
+
 function deviceCard(device) {
   var card = el('div', 'device' + (device.online ? '' : ' offline'));
   var head = el('div', 'device-head');
@@ -199,6 +231,7 @@ function deviceCard(device) {
 
   if (!device.online) {
     card.appendChild(el('div', 'turn-err', device.error || 'unreachable'));
+    card.appendChild(unlockForm(device));
     return card;
   }
 

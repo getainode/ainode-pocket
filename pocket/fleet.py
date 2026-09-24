@@ -423,6 +423,37 @@ class Fleet:
             self._cache.pop(resolved_id, None)
         return self._attach(entry)
 
+    def unlock(self, device_id, password):
+        """Get a fresh key from the device's own account API and adopt it.
+
+        For a box that rebooted and relocked, or one added with no key found
+        any other way. Tries every address the device is known on -- a
+        locked box still answers port 80 (see
+        ~/code/tiiny/tools/tiiny-data-locked-after-boot.md), so whichever
+        plane is reachable is enough. Raises NoDevice with the reason on
+        failure; on success the new key is live in memory and on disk
+        immediately, and the next telemetry read re-probes with it.
+        """
+        dev = self.get(device_id)
+        key = ""
+        for plane in dev.planes:
+            if plane.address:
+                key = device_mod.account_auth_key(plane.address, dev.id, password)
+                if key:
+                    break
+        if not key:
+            raise NoDevice("the device rejected that password, or didn't "
+                           "answer on any known address")
+        dev.key = key
+        for entry in self.registry.entries:
+            if entry.get("id") == dev.id:
+                entry["key"] = key
+                self.registry.save()
+                break
+        with self._guard:
+            self._cache.pop(dev.id, None)
+        return self.telemetry(dev.id, force=True)
+
     def forget(self, device_id):
         self.devices.pop(device_id, None)
         self.locks.pop(device_id, None)

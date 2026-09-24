@@ -433,6 +433,47 @@ class TestRegistration(FakeFleetCase):
         self.assertEqual(Registry(self.fleet.registry.path).entries, [])
 
 
+class TestUnlock(FakeFleetCase):
+    """Fleet.unlock(): a fresh key adopted in memory and on disk.
+
+    device_mod.account_auth_key() is the real HTTP call, tested on its own in
+    test_account_auth.py; here the point is what Fleet does with whatever
+    that call returns.
+    """
+    def setUp(self):
+        super().setUp()
+        self._real = device_mod.account_auth_key
+
+    def tearDown(self):
+        device_mod.account_auth_key = self._real
+        super().tearDown()
+
+    def test_success_updates_key_in_memory_and_on_disk(self):
+        # The fake only answers to its own real key, so use that as the
+        # "freshly returned" key -- proves the round trip (adopt it, then
+        # the very next telemetry read uses it) actually works, not just
+        # that a string got copied around.
+        device_mod.account_auth_key = lambda address, serial, password: self.fake.key
+        self.fleet.devices[self.fake.serial].key = "stale-key"
+        telemetry = self.fleet.unlock(self.fake.serial, "the-password")
+        self.assertEqual(self.fleet.devices[self.fake.serial].key, self.fake.key)
+        reloaded = Registry(self.fleet.registry.path)
+        entry = next(e for e in reloaded.entries if e["id"] == self.fake.serial)
+        self.assertEqual(entry["key"], self.fake.key)
+        self.assertTrue(telemetry.get("online"))
+
+    def test_wrong_password_raises_and_leaves_the_old_key(self):
+        device_mod.account_auth_key = lambda address, serial, password: ""
+        old_key = self.fleet.devices[self.fake.serial].key
+        with self.assertRaises(NoDevice):
+            self.fleet.unlock(self.fake.serial, "wrong")
+        self.assertEqual(self.fleet.devices[self.fake.serial].key, old_key)
+
+    def test_unknown_device_raises(self):
+        with self.assertRaises(NoDevice):
+            self.fleet.unlock("no-such-device", "x")
+
+
 class TestChatCapability(FakeFleetCase):
     """What a model is for, as the device reports it."""
 
