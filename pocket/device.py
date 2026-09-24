@@ -413,7 +413,14 @@ class Device:
                 detail = exc.read().decode("utf-8", "replace")[:400]
             except Exception:
                 pass
-            if exc.code in (502, 503, 504):
+            if exc.code in (502, 503):
+                # An instant 502/503 is the gateway saying the service behind it
+                # is down (seen 2026-09-23 on a box right after a firmware update).
+                raise DeviceError(
+                    "HTTP %d from %s. The box answered but its model service "
+                    "is not up yet; wait for it to finish starting, or restart "
+                    "the Tiiny." % (exc.code, url), status=exc.code) from None
+            if exc.code == 504:
                 raise DeviceTimeout(
                     "HTTP %d from %s. At about 220 seconds this is the gateway's "
                     "documented per-request ceiling; use streaming for long output."

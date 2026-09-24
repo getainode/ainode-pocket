@@ -988,6 +988,9 @@ class FakeHandler(BaseHTTPRequestHandler):
 
 class FakeServer(ThreadingHTTPServer):
     daemon_threads = True
+    # The default backlog of 5 resets connections when eight callers and their
+    # telemetry reads arrive together; a real gateway does not.
+    request_queue_size = 64
     allow_reuse_address = True
 
     def __init__(self, state, host="127.0.0.1", port=0):
