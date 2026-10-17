@@ -76,10 +76,10 @@ PLANE_PREFERENCE = (PLANE_USB, PLANE_LAN)
 # Interface names the device reports for each plane in device.json.
 PLANE_BY_INTERFACE = {"usb0": PLANE_USB, "wlan0": PLANE_LAN, "eth0": PLANE_LAN}
 
-# The USB gadget link. device.json reports network 172.17.7.176/30 with the
-# device on .177 and the host on .178, and several boxes can be plugged in at
-# once, each on its own interface and its own /30.
-USB_NET_PREFIX = "172.17."
+# Known Tiiny USB gadget ranges, including TiinyOS 2026-10. Several boxes can
+# be plugged in at once, each on its own interface and its own /30. Keep this
+# list narrow: the standard-library bind scan costs about 0.4 s per /16.
+USB_NET_PREFIXES = ("172.17.", "172.30.")
 
 UDP_DISCOVERY_PORT = 39217
 # device.json advertises both the port and this token. Verified live: sending
@@ -313,19 +313,16 @@ class Device:
         """Which address to try, in order.
 
         USB first when the cable is in this host, because that link is fixed and
-        the LAN address is DHCP. When it is not, the USB plane goes last rather
-        than being dropped: it costs a six second hang to try, and it is still
-        the right answer if the LAN address has moved and the cable is back.
+        the LAN address is DHCP. Skip USB when this host does not hold its link:
+        trying an unheld address can hang for the full request timeout.
         The plane that last worked wins, as long as it is still viable.
         """
         viable = [p for p in self.planes
                   if p.name != PLANE_USB or usb_reachable(p.address)]
-        rest = [p for p in self.planes if p not in viable]
-        ordered = viable + rest
         remembered = [p for p in viable if p.name == self.plane]
         if remembered:
-            return remembered + [p for p in ordered if p is not remembered[0]]
-        return ordered
+            return remembered + [p for p in viable if p is not remembered[0]]
+        return viable
 
     # ------------------------------------------------------------- transport
     @staticmethod
@@ -456,7 +453,12 @@ class Device:
     def open(self, surface, method, path, body=None, timeout=None, stream=False):
         """Open a response, trying each route this surface allows."""
         routes = self.attempts(surface, path)
-        last = None
+        skipped = [p.address for p in self.planes if p.name == PLANE_USB
+                   and not any(route[0] is p for route in routes)]
+        note = ("; skipped USB %s because this host does not hold its link"
+                % ", ".join(skipped)) if skipped else ""
+        if not routes:
+            raise DeviceUnreachable("no reachable device planes" + note)
         for index, (plane, root, host) in enumerate(routes):
             final = index == len(routes) - 1
             # Probe briefly while there is somewhere else to fall back to.
@@ -467,15 +469,17 @@ class Device:
                 resp = self._open(root + path, method, body, budget, stream, host)
             except DeviceError as exc:
                 if final or not self._retryable(exc):
+                    # Keep the LAN failure's type, status, and detail, while
+                    # explaining why the advertised USB address was not tried.
+                    if note:
+                        exc.args = (str(exc) + note,)
                     raise
-                last = exc
                 continue
             transport = None
             if surface == "gateway":
                 transport = TRANSPORT_VHOST if host else TRANSPORT_DIRECT
             self._remember(plane, transport)
             return resp
-        raise last  # unreachable: the last attempt either returns or raises
 
     def call(self, surface, method, path, body=None, timeout=None):
         """One JSON call. Raises DeviceBusy on the in-band 150004."""
@@ -675,7 +679,7 @@ def host_links():
     """
     out = []
     for interface, address, prefix in _interface_addresses():
-        if prefix not in (30, 31) or not address.startswith(USB_NET_PREFIX):
+        if prefix not in (30, 31) or not address.startswith(USB_NET_PREFIXES):
             continue
         peer = peer_address(address, prefix)
         if peer:
@@ -690,8 +694,8 @@ LINKS_TTL = 30.0
 def host_link_peers(force=False):
     """Peer addresses this host is currently plugged into, cached briefly.
 
-    Reading them binds 32768 sockets, and telemetry asks often, so the answer is held for
-    a few seconds. The cable moving is noticed within the TTL.
+    Reading them binds at most 32768 sockets per known /16, and telemetry asks
+    often, so the answer is held briefly. Cable changes are noticed within the TTL.
     """
     now = _now()
     if force or now - _LINKS_CACHE["at"] > LINKS_TTL:
@@ -706,7 +710,7 @@ def usb_reachable(address):
     A device advertises its USB address whether or not the cable is in *this*
     machine, and an address on a /30 we are not part of does not refuse the
     connection, it hangs until it times out. Measured at six seconds. So an
-    unplugged USB plane has to be deprioritised rather than tried hopefully.
+    unplugged USB plane must be skipped rather than tried hopefully.
     Loopback is always reachable, which is what makes the fakes work.
     """
     text = str(address or "")
@@ -740,28 +744,30 @@ def _interface_addresses():
     """(interface, ipv4, prefix length) for every USB link this host holds.
 
     Standard library only, and nothing is run: a Tiiny on the cable is a
-    point-to-point /30 inside 172.17/16, the box takes the first usable address
+    point-to-point /30 inside a known USB /16, the box takes the first usable address
     and this machine the second, so which links are attached is settled by
     bind(), one call per usable address. bind() succeeds only on an address the
-    host really holds. All 32768 of them cost about four tenths of a second on a
-    laptop. The interface name is not knowable this way and is reported as
+    host really holds. Each /16 costs at most 32768 binds, about four tenths of
+    a second on a laptop; only the two known Tiiny ranges are scanned. The
+    interface name is not knowable this way and is reported as
     "usb"; nothing reads it for anything but display. The farm forbids shelling
     out, which is why the ip and ifconfig readers this replaced are gone.
     """
     out = []
-    for third in range(256):
-        for base in range(0, 256, 4):
-            for ours in (base + 2, base + 1):
-                address = "%s%d.%d" % (USB_NET_PREFIX, third, ours)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                try:
-                    sock.bind((address, 0))
-                except OSError:
-                    continue
-                finally:
-                    sock.close()
-                out.append(("usb", address, 30))
-                break
+    for prefix in USB_NET_PREFIXES:
+        for third in range(256):
+            for base in range(0, 256, 4):
+                for ours in (base + 2, base + 1):
+                    address = "%s%d.%d" % (prefix, third, ours)
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    try:
+                        sock.bind((address, 0))
+                    except OSError:
+                        continue
+                    finally:
+                        sock.close()
+                    out.append(("usb", address, 30))
+                    break
     return out
 
 
@@ -838,7 +844,7 @@ def planes_from(payload, fallback_address=None):
             address = entry.get("address")
             interface = entry.get("interface") or ""
             name = PLANE_BY_INTERFACE.get(interface)
-            if name is None and str(address or "").startswith(USB_NET_PREFIX):
+            if name is None and str(address or "").startswith(USB_NET_PREFIXES):
                 name = PLANE_USB
             elif name is None:
                 name = PLANE_LAN
