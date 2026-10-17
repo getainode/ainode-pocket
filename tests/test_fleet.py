@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 # `python3 -m unittest discover -s tests` makes this directory the top level, so
 # a relative import has no parent package. Put the repository root on the path
@@ -255,15 +256,58 @@ class TestPlanes(unittest.TestCase):
         self.assertEqual(dev.active.name, "usb")
         self.assertEqual([p.name for p in dev.ordered_planes()], ["usb", "lan"])
 
-    def test_an_unplugged_usb_plane_goes_last(self):
+    def test_an_unplugged_usb_plane_is_not_tried(self):
         """The device advertises its USB address whether or not the cable is in
         this machine, and connecting to one that is not costs a six second hang
-        rather than a refusal. So it must not be tried first."""
+        rather than a refusal. So it must not be tried."""
         dev = device_mod.Device("id", "name", planes=[
             {"name": "usb", "address": "172.17.99.177"},
             {"name": "lan", "address": "127.0.0.1"}])
-        self.assertEqual([p.name for p in dev.ordered_planes()], ["lan", "usb"])
+        with mock.patch.object(device_mod, "host_link_peers", return_value=[]):
+            self.assertEqual([p.name for p in dev.ordered_planes()], ["lan"])
         self.assertEqual(dev.active.name, "usb", "the record still keeps it")
+
+    def test_a_172_30_host_link_is_found_and_preferred(self):
+        def bind(address):
+            if address[0] != "172.30.111.58":
+                raise OSError("address not held")
+
+        sock = mock.Mock()
+        sock.bind.side_effect = bind
+        dev = device_mod.Device("id", "name", planes=[
+            {"name": "usb", "address": "172.30.111.57"},
+            {"name": "lan", "address": "192.168.1.5"}])
+        with mock.patch.object(device_mod.socket, "socket", return_value=sock), \
+                mock.patch.dict(device_mod._LINKS_CACHE, {"at": 0.0, "peers": []}):
+            self.assertIn("172.30.111.57", device_mod.host_link_peers(force=True))
+            self.assertEqual([p.name for p in dev.ordered_planes()], ["usb", "lan"])
+        self.assertLessEqual(sock.bind.call_count, 2 * 32768)
+        self.assertEqual(sock.close.call_count, sock.bind.call_count)
+
+    def test_failed_lan_does_not_fall_through_to_unheld_usb(self):
+        dev = device_mod.Device("id", "name", transport="direct", planes=[
+            {"name": "usb", "address": "172.30.111.57"},
+            {"name": "lan", "address": "192.168.1.5"}])
+        failure = device_mod.DeviceUnreachable("LAN connection reset")
+        with mock.patch.object(device_mod, "host_link_peers", return_value=[]), \
+                mock.patch.object(dev, "_open", side_effect=failure) as opened:
+            with self.assertRaises(device_mod.DeviceUnreachable) as caught:
+                dev.open("gateway", "GET", "/v1/models")
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_args.args[0], "http://192.168.1.5:8800/v1/models")
+        self.assertIn("LAN connection reset", str(caught.exception))
+        self.assertIn("skipped USB 172.30.111.57", str(caught.exception))
+        self.assertIn("this host does not hold", str(caught.exception))
+
+    def test_only_unheld_usb_fails_without_a_network_call(self):
+        dev = device_mod.Device("id", "name", planes=[
+            {"name": "usb", "address": "172.30.111.57"}])
+        with mock.patch.object(device_mod, "host_link_peers", return_value=[]), \
+                mock.patch.object(dev, "_open") as opened:
+            with self.assertRaisesRegex(device_mod.DeviceUnreachable,
+                                        "this host does not hold"):
+                dev.open("mgmt", "GET", "/api/v1/sys/info")
+        opened.assert_not_called()
 
     def test_peer_address_of_a_point_to_point_link(self):
         self.assertEqual(device_mod.peer_address("172.17.7.178", 30), "172.17.7.177")
@@ -274,7 +318,7 @@ class TestPlanes(unittest.TestCase):
         # Whatever this machine has, the shape has to be right: a /30 or /31 in
         # the USB range, with a peer that is not us.
         for interface, ours, peer in device_mod.host_links():
-            self.assertTrue(ours.startswith("172.17."))
+            self.assertTrue(ours.startswith(("172.17.", "172.30.")))
             self.assertNotEqual(ours, peer)
             self.assertTrue(interface)
 

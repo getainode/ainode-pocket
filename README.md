@@ -243,12 +243,18 @@ USB is a point-to-point `/30` that never changes; the Wi-Fi address is DHCP and
 will move. So Pocket keeps both, prefers USB, and falls back to the LAN address
 when the cable is out. Several boxes can be plugged in at once, each on its own
 interface and its own `/30`, and Pocket enumerates the host's links to find them.
+The standard-library bind scan covers the known Tiiny USB ranges, `172.17/16`
+and `172.30/16`, with at most 32768 local binds per range and no shell commands.
+Link detection is cached for 30 seconds, so cable changes can take that long to
+appear.
 
 One wrinkle worth knowing, because it cost a measurement to find: a device
 advertises its USB address whether or not the cable is in **your** machine, and
-connecting to a `/30` you are not part of does not get refused, it hangs for six
-seconds. So the USB plane is only tried first when this host is actually on that
-link.
+connecting to a `/30` you are not part of can hang for the full request timeout.
+Pocket skips that USB plane unless this host holds its link. If the LAN call
+fails, the error preserves the LAN failure and explains that USB was skipped
+because this host does not hold the link. The USB address stays registered, so
+it can be used after the cable is plugged into this host and detection refreshes.
 
 ### Discovery
 
