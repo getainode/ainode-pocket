@@ -13,7 +13,7 @@ import socket
 import threading
 import time
 import traceback
-import http.client
+import io
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -223,37 +223,21 @@ class App:
         self.guard = threading.Lock()
 
 
-class HeaderClock:
-    """One request's header deadline. finish() and expire() are mutually exclusive, so a timer
-    that fires as the headers complete can never cut a request whose headers are in (DB-ASR-R4-001)."""
+class DeadlineIO(socket.SocketIO):
+    """Socket reads that honor a deadline: each recv waits at most the time left, so the request line
+    and headers end at HEADER_SECONDS however slowly bytes arrive (DB-ASR-002). The handler thread is
+    the only one that reads or closes the socket, so no timer can cut a request whose headers are in
+    or reach the next keep-alive request (DB-ASR-R4-001, DB-ASR-R5-001)."""
 
-    current = threading.local()  # the clock of the request this handler thread is reading
+    deadline = None
 
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.state = "reading"
-
-    def finish(self):
-        with self.lock:
-            if self.state == "reading":
-                self.state = "done"
-
-    def expire(self):
-        with self.lock:
-            if self.state != "reading":
-                return False
-            self.state = "expired"
-            return True
-
-
-class HeaderMessage(http.client.HTTPMessage):
-    # http.client.parse_headers builds this only after it has read the blank line that ends the
-    # headers, so this is the exact end-of-headers point.
-    def __init__(self, *args, **kwargs):
-        clock = getattr(HeaderClock.current, "clock", None)
-        if clock is not None:
-            clock.finish()
-        super().__init__(*args, **kwargs)
+    def readinto(self, b):
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("header deadline passed")
+            self._sock.settimeout(min(REQUEST_IDLE_SECONDS, left))
+        return super().readinto(b)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -262,35 +246,29 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         self.timeout = REQUEST_IDLE_SECONDS
         super().setup()
+        self.rfile.close()  # swap makefile's reader for one that honors the header deadline
+        self.reader = DeadlineIO(self.connection, "rb")
+        self.rfile = io.BufferedReader(self.reader)
 
     def handle_one_request(self):
-        # DB-ASR-002 round 3: trickled bytes reset the idle timeout, so the request line and headers
-        # also get an absolute deadline. The timer only lives until the headers are parsed.
-        clock = HeaderClock()  # request-local, so a late timer from one request never touches the next
-        HeaderClock.current.clock = clock
-        timer = threading.Timer(HEADER_SECONDS, self.header_deadline_passed, args=(clock,))
-        timer.daemon = True
-        timer.start()
+        # The request line and headers get an absolute deadline; parse_request lifts it once they are in.
+        self.reader.deadline = time.monotonic() + HEADER_SECONDS
         try:
             super().handle_one_request()
         finally:
-            timer.cancel()
-            clock.finish()
-            HeaderClock.current.clock = None
+            self.end_header_deadline()
 
     def parse_request(self):
         ok = super().parse_request()
-        HeaderClock.current.clock.finish()  # also covers a request with no header block
+        self.end_header_deadline()
         return ok
 
-    def header_deadline_passed(self, clock):
-        if clock.expire():
-            try:
-                self.connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+    def end_header_deadline(self):
+        if self.reader.deadline is not None:
+            self.reader.deadline = None
+            self.connection.settimeout(self.timeout)
+
     server_version = "ainode-pocket/" + VERSION
-    MessageClass = HeaderMessage
 
     @property
     def app(self):

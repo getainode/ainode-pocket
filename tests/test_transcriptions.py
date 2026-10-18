@@ -350,27 +350,55 @@ class TestTranscriptions(ServerCase):
         self.assertEqual(status, 200)
 
 
-    def test_headers_completed_at_the_deadline_are_not_cut(self):
-        # DB-ASR-R4-001: the headers are in, then the rest of parse_request runs past the deadline.
-        real = server.HeaderMessage.__init__
+    def test_headers_in_at_the_deadline_are_not_cut_on_keep_alive(self):
+        # DB-ASR-R4-001 and DB-ASR-R5-001: two keep-alive requests, each pausing past the header
+        # deadline right after the blank line is read and before the message is built. Both are served.
+        real = http.client._read_headers
 
-        def slow_after_headers(message, *args, **kwargs):
-            real(message, *args, **kwargs)  # marks the headers finished, as in production
-            time.sleep(0.5)                  # then the rest of parse_request outlasts the deadline
+        def slow_after_blank_line(fp):
+            lines = real(fp)
+            if isinstance(getattr(fp, "raw", None), server.DeadlineIO):  # the server's reads only
+                time.sleep(0.4)
+            return lines
 
         with mock.patch.object(server, "HEADER_SECONDS", 0.15), \
-                mock.patch.object(server.HeaderMessage, "__init__", slow_after_headers):
-            status, _, _ = self.post()
+                mock.patch.object(http.client, "_read_headers", slow_after_blank_line):
+            conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=10)
+            try:
+                socks = []
+                for _ in range(2):
+                    conn.request("GET", "/api/state")
+                    response = conn.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, 200)
+                    socks.append(conn.sock)
+                self.assertIs(socks[0], socks[1])  # one keep-alive connection, never reopened
+            finally:
+                conn.close()
+            status, _, _ = self.post()  # the upload body is read after the header deadline
         self.assertEqual(status, 200)
 
-    def test_header_clock_finish_and_expire_exclude_each_other(self):
-        clock = server.HeaderClock()
-        clock.finish()
-        self.assertFalse(clock.expire())
-        late = server.HeaderClock()
-        self.assertTrue(late.expire())
-        late.finish()
-        self.assertEqual(late.state, "expired")
+    def test_header_deadline_holds_after_a_slow_body(self):
+        # The deadline is lifted per request: a later request on the same connection gets its own.
+        import socket
+        with mock.patch.object(server, "HEADER_SECONDS", 0.3), \
+                mock.patch.object(server, "REQUEST_IDLE_SECONDS", 5):
+            sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10)
+            try:
+                sock.sendall(b"GET /api/state HTTP/1.1\r\nHost: x\r\n\r\n")
+                time.sleep(0.5)
+                sock.sendall(b"GET /api/state HTTP/1.1\r\nX-Slow: a")  # never finishes its headers
+                started = time.monotonic()
+                data = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                sock.close()
+        self.assertEqual(data.count(b"HTTP/1.1 200"), 1)
+        self.assertLess(time.monotonic() - started, 3)
 
 
 class TestTranscriptionVhost(TestTranscriptions):
