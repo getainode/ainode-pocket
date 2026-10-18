@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from unittest import mock
@@ -151,6 +152,42 @@ class TestEmbeddingsFraming(ServerCase):
                 lock.release(held)
         self.assertEqual((status, payload["error"]["type"]), (503, "device_busy"))
         self.assertLess(waited, 2, "a queued request gives up at EMBED_LOCK_WAIT, not the 600 s default")
+
+    def test_another_process_holding_the_lock_file_is_bounded(self):
+        """DB-EMB-R2-001: the deadline covers the cross-process flock, not only the in-process lock."""
+        dev, lock = self.fleet.route(MODEL)
+        holder = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import fcntl,os,sys,time; fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT); "
+             "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); time.sleep(30)", lock.path],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            with mock.patch.object(gateway, "EMBED_LOCK_WAIT", 0.3):
+                started = time.monotonic()
+                status, payload = TestEmbeddings.post(self, {"model": MODEL, "input": "x"})
+                waited = time.monotonic() - started
+            self.assertEqual((status, payload["error"]["type"]), (503, "device_busy"))
+            self.assertLess(waited, 2, "the external file lock wait must end at EMBED_LOCK_WAIT")
+            self.assertFalse(lock.busy, "a timed-out acquire must release what it took")
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        status, _ = TestEmbeddings.post(self, {"model": MODEL, "input": "x"})
+        self.assertEqual(status, 200, "the lock and the request slot recover once the holder exits")
+
+    def test_unnamed_device_address_is_not_in_errors(self):
+        """DB-EMB-R2-002: a device without a friendly name is named by its address; errors name no device."""
+        dev, _ = self.fleet.route(MODEL)
+        busy = device_mod.DeviceBusy("busy", code=150004)
+        for exc in (device_mod.DeviceError("x"), device_mod.DeviceTimeout("x"), busy):
+            with mock.patch.object(dev, "name", "10.9.8.7"), mock.patch.object(dev, "id", "10.9.8.7"), \
+                    mock.patch.object(device_mod.Device, "embeddings", side_effect=exc), \
+                    mock.patch.object(gateway, "BUSY_BACKOFF", 0), mock.patch.object(gateway.time, "sleep"), \
+                    mock.patch("sys.stderr"):
+                status, payload = TestEmbeddings.post(self, {"model": MODEL, "input": "x"})
+            self.assertIn(status, (502, 503, 504))
+            self.assertNotIn("10.9.8.7", json.dumps(payload), type(exc).__name__)
 
     def test_device_errors_never_carry_device_detail(self):
         secret = "http://10.9.8.7:8080/v1/embeddings returned 500: internal stack"

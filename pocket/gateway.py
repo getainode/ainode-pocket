@@ -236,8 +236,8 @@ def embeddings(fleet, body, timeout=120):
     try:
         held = lock.acquire(why="embeddings %s" % model_id, timeout=EMBED_LOCK_WAIT)
     except TimeoutError:
-        return error(503, "%s is busy with other requests; retry shortly." % dev.name, "device_busy",
-                     {"device": dev.id})
+        # Error replies name no device: one without a friendly name is named by its address (DB-EMB-R2-002).
+        return error(503, "The device is busy with other requests; retry shortly.", "device_busy")
     try:
         try:
             for attempt in range(BUSY_RETRIES):
@@ -245,21 +245,21 @@ def embeddings(fleet, body, timeout=120):
                     payload = dev.embeddings(body, timeout=timeout)
                 except device_mod.DeviceBusy:
                     if attempt == BUSY_RETRIES - 1:
-                        return error(503, "%s stayed busy through %d attempts. Something "
-                                     "outside this app's lock is using the device; "
+                        return error(503, "The device stayed busy through %d attempts. Something "
+                                     "outside this app's lock is using it; "
                                      "error 150004 means busy, not a bad request."
-                                     % (dev.name, BUSY_RETRIES), "device_busy", {"device": dev.id})
+                                     % BUSY_RETRIES, "device_busy")
                     time.sleep(BUSY_BACKOFF * (attempt + 1) + random.random() * 0.3)
                     continue
                 except device_mod.DeviceTimeout as exc:
                     # Device URLs and bodies stay in the log, never in the reply (Daybreak DB-EMB-003).
                     print("embeddings: %s timed out: %s" % (dev.name, exc), file=sys.stderr, flush=True)
-                    return error(504, "%s timed out. Send fewer inputs in one request." % dev.name,
-                                 "gateway_timeout", {"device": dev.id})
+                    return error(504, "The device timed out. Send fewer inputs in one request.",
+                                 "gateway_timeout")
                 except device_mod.DeviceError as exc:
                     print("embeddings: %s failed: %s" % (dev.name, exc), file=sys.stderr, flush=True)
-                    return error(502, "%s returned an error; the details are in the Pocket log." % dev.name,
-                                 "device_error", {"device": dev.id})
+                    return error(502, "The device returned an error; the details are in the Pocket log.",
+                                 "device_error")
                 if isinstance(payload, dict):
                     payload.setdefault("model", model_id)
                     payload["ainode_pocket"] = {"device": dev.id, "device_name": dev.name}

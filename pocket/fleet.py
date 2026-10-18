@@ -179,6 +179,8 @@ class DeviceLock:
             pass
 
     def acquire(self, why="inference", timeout=600):
+        # One deadline covers the in-process lock and every file lock (Daybreak DB-EMB-R2-001).
+        deadline = time.monotonic() + timeout
         with self._guard:
             self._waiting += 1
         try:
@@ -189,6 +191,8 @@ class DeviceLock:
             with self._guard:
                 self._waiting -= 1
         handles = []
+        # Busy from here: routing must see a request that is waiting on another process's file lock.
+        self._held_since = time.time()
         if fcntl is not None:
             # Always the serial lock first, then the address locks in sorted
             # order. Every Pocket process takes them in the same order, so two
@@ -197,12 +201,15 @@ class DeviceLock:
             record = {"owner": self.owner, "pid": os.getpid(),
                       "why": why, "since": time.time()}
             for path in [self.path] + self.neighbour_paths():
-                fd = None
+                fd, locked = None, True
                 try:
                     fd = self._open_shared(path)
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                    self._write_record(fd, record)
-                    handles.append(fd)
+                    locked = self._flock_until(fd, deadline)
+                    if not locked:
+                        os.close(fd)
+                    else:
+                        self._write_record(fd, record)
+                        handles.append(fd)
                 except OSError as exc:
                     # Degrade rather than refuse to serve, but record why so the
                     # UI can say the lock is not fully shared.
@@ -213,8 +220,23 @@ class DeviceLock:
                             pass
                     self.shared = False
                     self.reason = str(exc)
-        self._held_since = time.time()
+                if not locked:
+                    # Outside the try: TimeoutError is an OSError and must not take the degrade path.
+                    self.release(handles)
+                    raise TimeoutError("waited %ss for the shared lock on %s" % (timeout, self.host))
         return handles
+
+    @staticmethod
+    def _flock_until(fd, deadline):
+        """Non-blocking flock retried until the deadline; another process can hold the file indefinitely."""
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
 
     def release(self, handles):
         self._held_since = None
