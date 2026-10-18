@@ -27,7 +27,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from pocket import __version__, bench as bench_mod, device as device_mod  # noqa: E402
-from pocket import fake as fake_mod, server as server_mod  # noqa: E402
+from pocket import bonjour, fake as fake_mod, server as server_mod  # noqa: E402
 from pocket.fleet import Fleet, Registry, data_dir  # noqa: E402
 
 BANNER = "AINode Pocket %s  ·  Made in Texas" % __version__
@@ -94,6 +94,8 @@ def cmd_serve(args):
     print("  http://127.0.0.1:%d/v1" % args.port)
     if lan:
         print("  http://%s:%d/v1" % (lan, args.port))
+    # Fake devices are a demo, so only a real Pocket announces itself on the LAN.
+    beacon = None if args.fake else bonjour.advertise(args.port, __version__, len(fleet.devices))
     print("\nctrl+c to stop")
     # Redirected stdout is block buffered, so a supervisor or a log file would
     # otherwise show nothing at all until the process exits.
@@ -105,6 +107,8 @@ def cmd_serve(args):
     finally:
         httpd.shutdown()
         httpd.server_close()
+        if beacon:
+            beacon.terminate()
         for fake in fakes:
             fake.stop()
         if args.fake:
