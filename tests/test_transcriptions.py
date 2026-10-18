@@ -221,6 +221,55 @@ class TestTranscriptions(ServerCase):
             self.fake.state.inference.release()
 
 
+    def stalled_upload(self, sent=1, declared=100):
+        import socket
+        sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10)
+        sock.sendall(("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: x\r\n"
+                      "Content-Type: multipart/form-data; boundary=b\r\n"
+                      "Content-Length: %d\r\n\r\n" % declared).encode() + b"x" * sent)
+        return sock
+
+    def test_stalled_upload_times_out_and_frees_its_slot(self):
+        # DB-ASR-001: a client that stops sending gets 408 instead of holding a thread forever.
+        with mock.patch.object(server, "UPLOAD_IDLE_SECONDS", 0.3):
+            sock = self.stalled_upload()
+            try:
+                reply = sock.recv(200).decode(errors="replace")
+            finally:
+                sock.close()
+        self.assertIn(" 408 ", reply.split("\r\n")[0])
+        status, _, _ = self.post()
+        self.assertEqual(status, 200)
+
+    def test_total_deadline_applies_to_a_trickle(self):
+        with mock.patch.object(server, "UPLOAD_TOTAL_SECONDS", 0.5):
+            sock = self.stalled_upload()
+            try:
+                started = time.monotonic()
+                reply = sock.recv(200).decode(errors="replace")
+            finally:
+                sock.close()
+        self.assertIn(" 408 ", reply.split("\r\n")[0])
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_uploads_beyond_the_slot_limit_get_503(self):
+        slots = threading.BoundedSemaphore(1)
+        with mock.patch.object(server, "UPLOAD_SLOTS", slots), \
+                mock.patch.object(server, "UPLOAD_IDLE_SECONDS", 5):
+            sock = self.stalled_upload()
+            try:
+                for _ in range(50):
+                    if not slots.acquire(blocking=False):
+                        break
+                    slots.release()
+                    time.sleep(0.02)
+                status, _, payload = self.post()
+            finally:
+                sock.close()
+        self.assertEqual(status, 503)
+        self.assertIn("Too many audio uploads", payload["error"]["message"])
+
+
 class TestTranscriptionVhost(TestTranscriptions):
     fake_kwargs = {"vhost_only": True}
 

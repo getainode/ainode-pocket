@@ -23,6 +23,10 @@ from .fleet import Fleet, NoDevice
 
 VERSION = "0.1.4"
 MAX_AUDIO_UPLOAD = 25 * 1024 * 1024
+# DB-ASR-001: a slow or stalled upload must not hold a handler thread forever.
+UPLOAD_IDLE_SECONDS = 15      # longest gap between received chunks
+UPLOAD_TOTAL_SECONDS = 120    # whole body, about 1.7 Mbit/s for a full 25 MiB upload
+UPLOAD_SLOTS = threading.BoundedSemaphore(4)  # uploads read at once; the rest get 503
 PORT = 8430
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -527,7 +531,16 @@ class Handler(BaseHTTPRequestHandler):
             return reject(400, "Content-Length must be a non-negative integer.")
         if length > MAX_AUDIO_UPLOAD:
             return reject(413, "Audio uploads must be 25 MiB or smaller.")
-        raw = self.rfile.read(length)
+        if not UPLOAD_SLOTS.acquire(blocking=False):
+            self.close_connection = True
+            return self.send_json(*gateway.error(
+                503, "Too many audio uploads in progress; retry shortly.", "server_busy"))
+        try:
+            raw = self.read_body(length)
+        finally:
+            UPLOAD_SLOTS.release()
+        if raw is None:
+            return reject(408, "Audio upload was too slow or stalled; send the whole file promptly.")
         if len(raw) != length:
             return reject(400, "Audio upload ended before Content-Length bytes arrived.")
         try:
@@ -538,6 +551,29 @@ class Handler(BaseHTTPRequestHandler):
         if status == 200 and fields.get("response_format", "json") == "text":
             return self.send_text(status, payload)
         return self.send_json(status, payload)
+
+    def read_body(self, length):
+        """Read exactly length bytes in chunks; None when the client stalls or runs out of time."""
+        deadline = time.monotonic() + UPLOAD_TOTAL_SECONDS
+        previous = self.connection.gettimeout()
+        chunks, got = [], 0
+        try:
+            while got < length:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.connection.settimeout(min(UPLOAD_IDLE_SECONDS, left))
+                try:
+                    chunk = self.rfile.read1(min(65536, length - got))
+                except (TimeoutError, OSError):
+                    return None
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+        finally:
+            self.connection.settimeout(previous)
+        return b"".join(chunks)
 
     def chat(self, payload):
         if payload.get("stream"):
