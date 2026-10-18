@@ -167,6 +167,45 @@ def chat(fleet, body, timeout=240):
     return error(503, "no device answered", "model_not_available")
 
 
+def transcribe(fleet, fields, timeout=600):
+    """Route an audio upload without altering the device's response."""
+    if not fields.get("model"):
+        return error(400, "field 'model' is required", "invalid_request_error")
+    if not fields.get("file") or not fields["file"][1]:
+        return error(400, "field 'file' must contain non-empty audio", "invalid_request_error")
+    if fields.get("response_format", "json") not in ("json", "text"):
+        return error(400, "response_format must be json or text", "invalid_request_error")
+    model_id = fields["model"]
+    slot = fleet.index().get(model_id)
+    if slot is not None and slot["type"] != "ASR":
+        return error(400, "%s has type %s and cannot transcribe audio. Choose an ASR model."
+                     % (model_id, slot["type"]), "invalid_request_error")
+    try:
+        dev, lock = fleet.route(model_id)
+    except NoDevice as exc:
+        return error(503, str(exc), "model_not_available")
+    with lock.turn(why="transcribe %s" % model_id):
+        try:
+            for attempt in range(BUSY_RETRIES):
+                try:
+                    return 200, dev.transcribe(fields, timeout=timeout)
+                except device_mod.DeviceBusy:
+                    if attempt == BUSY_RETRIES - 1:
+                        return error(503, "%s stayed busy through %d attempts. Something "
+                                     "outside this app's lock is using the device; "
+                                     "error 150004 means busy, not a bad request."
+                                     % (dev.name, BUSY_RETRIES), "device_busy", {"device": dev.id})
+                    time.sleep(BUSY_BACKOFF * (attempt + 1) + random.random() * 0.3)
+                except device_mod.DeviceTimeout as exc:
+                    return error(504, "%s. Try a shorter audio upload." % exc,
+                                 "gateway_timeout", {"device": dev.id})
+                except device_mod.DeviceError as exc:
+                    return error(502, "%s: %s" % (dev.name, exc), "device_error",
+                                 {"device": dev.id})
+        finally:
+            fleet.invalidate(dev.id)
+
+
 def chat_stream(fleet, body, timeout=600, on_device=None):
     """A streaming completion.
 
