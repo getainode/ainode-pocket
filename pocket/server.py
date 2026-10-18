@@ -13,6 +13,7 @@ import socket
 import threading
 import time
 import traceback
+import http.client
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -222,6 +223,39 @@ class App:
         self.guard = threading.Lock()
 
 
+class HeaderClock:
+    """One request's header deadline. finish() and expire() are mutually exclusive, so a timer
+    that fires as the headers complete can never cut a request whose headers are in (DB-ASR-R4-001)."""
+
+    current = threading.local()  # the clock of the request this handler thread is reading
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = "reading"
+
+    def finish(self):
+        with self.lock:
+            if self.state == "reading":
+                self.state = "done"
+
+    def expire(self):
+        with self.lock:
+            if self.state != "reading":
+                return False
+            self.state = "expired"
+            return True
+
+
+class HeaderMessage(http.client.HTTPMessage):
+    # http.client.parse_headers builds this only after it has read the blank line that ends the
+    # headers, so this is the exact end-of-headers point.
+    def __init__(self, *args, **kwargs):
+        clock = getattr(HeaderClock.current, "clock", None)
+        if clock is not None:
+            clock.finish()
+        super().__init__(*args, **kwargs)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -232,29 +266,31 @@ class Handler(BaseHTTPRequestHandler):
     def handle_one_request(self):
         # DB-ASR-002 round 3: trickled bytes reset the idle timeout, so the request line and headers
         # also get an absolute deadline. The timer only lives until the headers are parsed.
-        self.headers_done = False
-        timer = threading.Timer(HEADER_SECONDS, self.header_deadline_passed)
+        clock = HeaderClock()  # request-local, so a late timer from one request never touches the next
+        HeaderClock.current.clock = clock
+        timer = threading.Timer(HEADER_SECONDS, self.header_deadline_passed, args=(clock,))
         timer.daemon = True
-        self.header_timer = timer
         timer.start()
         try:
             super().handle_one_request()
         finally:
             timer.cancel()
+            clock.finish()
+            HeaderClock.current.clock = None
 
     def parse_request(self):
-        ok = super().parse_request()  # reads the headers
-        self.headers_done = True
-        self.header_timer.cancel()
+        ok = super().parse_request()
+        HeaderClock.current.clock.finish()  # also covers a request with no header block
         return ok
 
-    def header_deadline_passed(self):
-        if not self.headers_done:
+    def header_deadline_passed(self, clock):
+        if clock.expire():
             try:
                 self.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
     server_version = "ainode-pocket/" + VERSION
+    MessageClass = HeaderMessage
 
     @property
     def app(self):

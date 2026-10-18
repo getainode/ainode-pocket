@@ -350,6 +350,29 @@ class TestTranscriptions(ServerCase):
         self.assertEqual(status, 200)
 
 
+    def test_headers_completed_at_the_deadline_are_not_cut(self):
+        # DB-ASR-R4-001: the headers are in, then the rest of parse_request runs past the deadline.
+        real = server.HeaderMessage.__init__
+
+        def slow_after_headers(message, *args, **kwargs):
+            real(message, *args, **kwargs)  # marks the headers finished, as in production
+            time.sleep(0.5)                  # then the rest of parse_request outlasts the deadline
+
+        with mock.patch.object(server, "HEADER_SECONDS", 0.15), \
+                mock.patch.object(server.HeaderMessage, "__init__", slow_after_headers):
+            status, _, _ = self.post()
+        self.assertEqual(status, 200)
+
+    def test_header_clock_finish_and_expire_exclude_each_other(self):
+        clock = server.HeaderClock()
+        clock.finish()
+        self.assertFalse(clock.expire())
+        late = server.HeaderClock()
+        self.assertTrue(late.expire())
+        late.finish()
+        self.assertEqual(late.state, "expired")
+
+
 class TestTranscriptionVhost(TestTranscriptions):
     fake_kwargs = {"vhost_only": True}
 
