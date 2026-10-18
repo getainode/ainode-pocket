@@ -624,6 +624,9 @@ class Device:
     def chat(self, body, timeout=240):
         return self.gw("POST", "/v1/chat/completions", body, timeout=timeout)
 
+    def embeddings(self, body, timeout=120):
+        return self.gw("POST", "/v1/embeddings", body, timeout=timeout)
+
     def chat_stream(self, body, timeout=600):
         """Yield raw SSE lines from a streaming completion.
 

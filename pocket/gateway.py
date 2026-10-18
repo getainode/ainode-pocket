@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import time
 
 from . import device as device_mod
@@ -204,6 +205,70 @@ def transcribe(fleet, fields, timeout=600):
                                  {"device": dev.id})
         finally:
             fleet.invalidate(dev.id)
+
+
+MAX_EMBED_INPUTS = 256
+MAX_EMBED_CHARS = 1_000_000
+EMBED_LOCK_WAIT = 60  # seconds a request may queue for the device; beyond that it is a 503, not a held handler
+
+
+def embeddings(fleet, body, timeout=120):
+    """Route an OpenAI embeddings request to a device with the model loaded. Returns (status, payload)."""
+    if not isinstance(body, dict) or not body.get("model") or not isinstance(body["model"], str):
+        return error(400, "field 'model' is required", "invalid_request_error")
+    items = body.get("input")
+    items = [items] if isinstance(items, str) else items
+    if not isinstance(items, list) or not items or not all(isinstance(i, str) and i for i in items):
+        return error(400, "field 'input' must be a non-empty string or an array of non-empty strings",
+                     "invalid_request_error")
+    if len(items) > MAX_EMBED_INPUTS or sum(len(i) for i in items) > MAX_EMBED_CHARS:
+        return error(413, "embeddings take at most %d inputs and %d characters in one request"
+                     % (MAX_EMBED_INPUTS, MAX_EMBED_CHARS), "invalid_request_error")
+    model_id = body["model"]
+    slot = fleet.index().get(model_id)
+    if slot is not None and "embedding" not in (slot["capabilities"] or []):
+        return error(400, "%s has type %s and cannot embed text. Choose an embedding model."
+                     % (model_id, slot["type"]), "invalid_request_error")
+    try:
+        dev, lock = fleet.route(model_id)
+    except NoDevice as exc:
+        return error(503, str(exc), "model_not_available")
+    try:
+        held = lock.acquire(why="embeddings %s" % model_id, timeout=EMBED_LOCK_WAIT)
+    except TimeoutError:
+        # Error replies name no device: one without a friendly name is named by its address (DB-EMB-R2-002).
+        return error(503, "The device is busy with other requests; retry shortly.", "device_busy")
+    try:
+        try:
+            for attempt in range(BUSY_RETRIES):
+                try:
+                    payload = dev.embeddings(body, timeout=timeout)
+                except device_mod.DeviceBusy:
+                    if attempt == BUSY_RETRIES - 1:
+                        return error(503, "The device stayed busy through %d attempts. Something "
+                                     "outside this app's lock is using it; "
+                                     "error 150004 means busy, not a bad request."
+                                     % BUSY_RETRIES, "device_busy")
+                    time.sleep(BUSY_BACKOFF * (attempt + 1) + random.random() * 0.3)
+                    continue
+                except device_mod.DeviceTimeout as exc:
+                    # Device URLs and bodies stay in the log, never in the reply (Daybreak DB-EMB-003).
+                    print("embeddings: %s timed out: %s" % (dev.name, exc), file=sys.stderr, flush=True)
+                    return error(504, "The device timed out. Send fewer inputs in one request.",
+                                 "gateway_timeout")
+                except device_mod.DeviceError as exc:
+                    print("embeddings: %s failed: %s" % (dev.name, exc), file=sys.stderr, flush=True)
+                    return error(502, "The device returned an error; the details are in the Pocket log.",
+                                 "device_error")
+                if isinstance(payload, dict):
+                    payload.setdefault("model", model_id)
+                    payload["ainode_pocket"] = {"device": dev.id, "device_name": dev.name}
+                return 200, payload
+        finally:
+            fleet.invalidate(dev.id)
+    finally:
+        lock.release(held)
+    return error(503, "no device answered", "model_not_available")
 
 
 def chat_stream(fleet, body, timeout=600, on_device=None):

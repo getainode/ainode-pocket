@@ -86,6 +86,7 @@ from __future__ import annotations
 
 from . import multipart
 
+import hashlib
 import json
 import socket
 import threading
@@ -655,6 +656,8 @@ class FakeHandler(BaseHTTPRequestHandler):
             return self._transcribe()
         if path == "/v1/chat/completions":
             return self._chat(self._body())
+        if path == "/v1/embeddings":
+            return self._embeddings(self._body())
         if path == "/api/v1/models/unload_all":
             with state.guard:
                 state.loaded = []
@@ -811,6 +814,21 @@ class FakeHandler(BaseHTTPRequestHandler):
             return self._send(200, {"text": text})
         finally:
             self.state.inference.release()
+
+    def _embeddings(self, body):
+        """OpenAI-shaped vectors, deterministic per input, only for a loaded model."""
+        model_id = body.get("model")
+        if model_id not in self.state.loaded:
+            return self._send(404, {"error": {
+                "code": 404, "message": '"%s" is not loaded.' % model_id, "type": "model_not_found"}})
+        items = body.get("input")
+        items = [items] if isinstance(items, str) else items
+        data = [{"object": "embedding", "index": i,
+                 "embedding": [b / 255.0 for b in hashlib.sha256(text.encode()).digest()[:8]]}
+                for i, text in enumerate(items)]
+        tokens = sum(len(t.split()) for t in items)
+        return self._send(200, {"object": "list", "data": data, "model": model_id,
+                                "usage": {"prompt_tokens": tokens, "total_tokens": tokens}})
 
     def _chat(self, body):
         state = self.state
