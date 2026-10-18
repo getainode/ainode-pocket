@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import sys
+import time
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -99,14 +100,23 @@ class TestEmbeddingsFraming(ServerCase):
         return [line for line in data.decode("latin-1").split("\r\n") if line.startswith("HTTP/1.")]
 
     def test_bad_framing_is_refused_and_the_connection_closed(self):
-        body = json.dumps({"model": MODEL, "input": "x"}).encode()
+        # A clean request right behind the bad headers: kept alive, the server would answer it too (desync).
         second = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
-        for headers in ("Content-Length: -1\r\n", "", "Content-Length: 12\r\nContent-Length: 12\r\n",
-                        "Content-Length: 1_2\r\n", "Content-Length: +12\r\n",
-                        "Transfer-Encoding: chunked\r\nContent-Length: %d\r\n" % len(body)):
-            statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\n%s\r\n" % headers, body + second)
+        for headers in ("Content-Length: -1\r\n", "", "Content-Length: 0\r\nContent-Length: 0\r\n",
+                        "Transfer-Encoding: chunked\r\n", "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n"):
+            statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\n%s\r\n" % headers, second)
             self.assertEqual(len(statuses), 1, (headers, statuses))
             self.assertIn(" 400 ", statuses[0], headers)
+
+    def test_only_plain_decimal_lengths_are_accepted(self):
+        body = json.dumps({"model": MODEL, "input": "hello there"}).encode()
+        n = str(len(body))
+        for value in ("+" + n, n[0] + "_" + n[1:], "abc", " " + n):
+            statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % value, body)
+            self.assertEqual(len(statuses), 1, (value, statuses))
+            self.assertIn(" 400 ", statuses[0], value)
+        statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % n, body)
+        self.assertIn(" 200 ", statuses[0])
 
     def test_short_body_is_refused(self):
         statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: 500\r\n\r\n", b"{}")
@@ -128,10 +138,13 @@ class TestEmbeddingsFraming(ServerCase):
             dev, lock = self.fleet.route(MODEL)
             held = lock.acquire(why="test holds the device")
             try:
+                started = time.monotonic()
                 status, payload = TestEmbeddings.post(self, {"model": MODEL, "input": "x"})
+                waited = time.monotonic() - started
             finally:
                 lock.release(held)
         self.assertEqual((status, payload["error"]["type"]), (503, "device_busy"))
+        self.assertLess(waited, 2, "a queued request gives up at EMBED_LOCK_WAIT, not the 600 s default")
 
     def test_device_errors_never_carry_device_detail(self):
         secret = "http://10.9.8.7:8080/v1/embeddings returned 500: internal stack"
