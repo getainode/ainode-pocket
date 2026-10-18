@@ -86,25 +86,30 @@ class TestEmbeddingsFraming(ServerCase):
         self.fake.state.loaded.append(MODEL)
         self.fleet.invalidate()
 
-    def raw(self, head, body=b""):
-        """Send raw bytes; return every HTTP status line the server writes before closing."""
-        with socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10) as sock:
+    def raw(self, head, body=b"", half_close=False):
+        """Send raw bytes; return the HTTP status lines written and whether the server closed within 2 s."""
+        # Half-close only when asked: a half-closed client makes the server stop early and hides keep-alive.
+        with socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=2) as sock:
             sock.sendall(head.encode() + body)
-            sock.shutdown(socket.SHUT_WR)
-            data = b""
-            while True:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-        return [line for line in data.decode("latin-1").split("\r\n") if line.startswith("HTTP/1.")]
+            if half_close:
+                sock.shutdown(socket.SHUT_WR)
+            data, closed = b"", False
+            try:
+                while not closed:
+                    chunk = sock.recv(65536)
+                    closed = not chunk
+                    data += chunk
+            except socket.timeout:
+                pass
+        return [line for line in data.decode("latin-1").split("\r\n") if line.startswith("HTTP/1.")], closed
 
     def test_bad_framing_is_refused_and_the_connection_closed(self):
         # A clean request right behind the bad headers: kept alive, the server would answer it too (desync).
         second = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n"
         for headers in ("Content-Length: -1\r\n", "", "Content-Length: 0\r\nContent-Length: 0\r\n",
                         "Transfer-Encoding: chunked\r\n", "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n"):
-            statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\n%s\r\n" % headers, second)
+            statuses, closed = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\n%s\r\n" % headers, second)
+            self.assertTrue(closed, headers)
             self.assertEqual(len(statuses), 1, (headers, statuses))
             self.assertIn(" 400 ", statuses[0], headers)
 
@@ -112,14 +117,15 @@ class TestEmbeddingsFraming(ServerCase):
         body = json.dumps({"model": MODEL, "input": "hello there"}).encode()
         n = str(len(body))
         for value in ("+" + n, n[0] + "_" + n[1:], "abc", "-" + n):
-            statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % value, body)
+            statuses, closed = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % value, body)
+            self.assertTrue(closed, value)
             self.assertEqual(len(statuses), 1, (value, statuses))
             self.assertIn(" 400 ", statuses[0], value)
-        statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % n, body)
+        statuses, _ = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % n, body)
         self.assertIn(" 200 ", statuses[0])
 
     def test_short_body_is_refused(self):
-        statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: 500\r\n\r\n", b"{}")
+        statuses, _ = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: 500\r\n\r\n", b"{}", half_close=True)
         self.assertEqual(len(statuses), 1)
         self.assertIn(" 400 ", statuses[0])
 
