@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from unittest import mock
 
@@ -162,6 +163,12 @@ class TestEmbeddingsFraming(ServerCase):
             stdout=subprocess.PIPE, text=True)
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
+            # Routing must see the device as busy while a request waits on the other process's file lock.
+            waiter = threading.Thread(target=lambda: self.assertRaises(TimeoutError, lock.acquire, "t", 0.5))
+            waiter.start()
+            time.sleep(0.2)
+            self.assertTrue(lock.busy, "a wait on another process's lock reads as busy")
+            waiter.join()
             with mock.patch.object(gateway, "EMBED_LOCK_WAIT", 0.3):
                 started = time.monotonic()
                 status, payload = TestEmbeddings.post(self, {"model": MODEL, "input": "x"})
