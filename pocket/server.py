@@ -24,6 +24,7 @@ from . import multipart
 from .fleet import Fleet, NoDevice
 
 VERSION = "0.1.4"
+MAX_EMBED_BODY = 8 * 1024 * 1024
 MAX_AUDIO_UPLOAD = 25 * 1024 * 1024
 # DB-ASR-001: a slow or stalled upload must not hold a handler thread forever.
 UPLOAD_IDLE_SECONDS = 15      # longest gap between received chunks
@@ -526,11 +527,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/audio/transcriptions":
                 return self.transcribe()
+            if path == "/v1/embeddings" and int(self.headers.get("Content-Length") or 0) > MAX_EMBED_BODY:
+                self.close_connection = True  # unread bytes must never become another request
+                return self.send_json(*gateway.error(413, "Embedding requests must be 8 MiB or smaller.",
+                                                     "invalid_request_error"))
             payload = self.body()
             if payload is None:
                 return self.send_json(400, {"error": {"message": "body must be JSON"}})
             if path == "/v1/chat/completions":
                 return self.chat(payload)
+            if path == "/v1/embeddings":
+                return self.send_json(*gateway.embeddings(self.fleet, payload))
             if path == "/api/chat":
                 return self.page_chat(payload)
             if path == "/api/instances/load":

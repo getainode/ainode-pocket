@@ -1,0 +1,77 @@
+"""Offline coverage for the OpenAI embeddings endpoint."""
+import http.client
+import json
+import os
+import sys
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tests.test_server import ServerCase
+from pocket import device as device_mod
+from pocket import gateway, server
+
+MODEL = "Qwen/Qwen3-Embedding-0.6B"
+
+
+class TestEmbeddings(ServerCase):
+    def setUp(self):
+        super().setUp()
+        # Change only the offline fixture, never load a hardware model.
+        self.fake.state.loaded.append(MODEL)
+        self.fleet.invalidate()
+
+    def post(self, body, headers=None):
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=10)
+        try:
+            connection.request("POST", "/v1/embeddings", raw,
+                               headers={"Content-Type": "application/json", **(headers or {})})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode())
+        finally:
+            connection.close()
+
+    def test_string_and_list_inputs_route_to_the_loaded_model(self):
+        status, payload = self.post({"model": MODEL, "input": "hello"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual((payload["object"], len(payload["data"]), payload["model"]), ("list", 1, MODEL))
+        self.assertEqual(payload["ainode_pocket"]["device"], self.fake.serial)
+        status, payload = self.post({"model": MODEL, "input": ["a", "b", "c"]})
+        self.assertEqual([row["index"] for row in payload["data"]], [0, 1, 2])
+        self.assertNotEqual(payload["data"][0]["embedding"], payload["data"][1]["embedding"])
+
+    def test_bad_inputs_are_refused_before_any_device_call(self):
+        with mock.patch.object(device_mod.Device, "embeddings") as call:
+            for body in ({"input": "x"}, {"model": MODEL}, {"model": MODEL, "input": ""},
+                         {"model": MODEL, "input": []}, {"model": MODEL, "input": [1, 2]},
+                         {"model": MODEL, "input": ["ok", None]}, {"model": ["x"], "input": "x"}):
+                status, payload = self.post(body)
+                self.assertEqual(status, 400, body)
+            status, _ = self.post({"model": MODEL, "input": ["x"] * (gateway.MAX_EMBED_INPUTS + 1)})
+            self.assertEqual(status, 413)
+            status, _ = self.post({"model": MODEL, "input": "x" * (gateway.MAX_EMBED_CHARS + 1)})
+            self.assertEqual(status, 413)
+            self.assertFalse(call.called)
+
+    def test_chat_model_is_refused_with_its_type(self):
+        status, payload = self.post({"model": "deepreinforce-ai/Ornith-1.0-35B", "input": "x"})
+        self.assertEqual(status, 400)
+        self.assertIn("cannot embed text", payload["error"]["message"])
+
+    def test_oversized_body_is_refused_before_reading(self):
+        status, payload = self.post(b"", headers={"Content-Length": str(server.MAX_EMBED_BODY + 1)})
+        self.assertEqual(status, 413, payload)
+
+    def test_model_not_loaded_anywhere_is_503(self):
+        self.fake.state.loaded.remove(MODEL)
+        self.fleet.invalidate()
+        status, payload = self.post({"model": MODEL, "input": "x"})
+        self.assertEqual(status, 503, payload)
+
+    def test_busy_device_is_retried_then_reported(self):
+        with mock.patch.object(device_mod.Device, "embeddings", side_effect=device_mod.DeviceBusy("busy", code=150004)), \
+                mock.patch.object(gateway, "BUSY_BACKOFF", 0), mock.patch.object(gateway.time, "sleep"):
+            status, payload = self.post({"model": MODEL, "input": "x"})
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["type"], "device_busy")

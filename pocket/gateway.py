@@ -206,6 +206,58 @@ def transcribe(fleet, fields, timeout=600):
             fleet.invalidate(dev.id)
 
 
+MAX_EMBED_INPUTS = 256
+MAX_EMBED_CHARS = 1_000_000
+
+
+def embeddings(fleet, body, timeout=120):
+    """Route an OpenAI embeddings request to a device with the model loaded. Returns (status, payload)."""
+    if not isinstance(body, dict) or not body.get("model") or not isinstance(body["model"], str):
+        return error(400, "field 'model' is required", "invalid_request_error")
+    items = body.get("input")
+    items = [items] if isinstance(items, str) else items
+    if not isinstance(items, list) or not items or not all(isinstance(i, str) and i for i in items):
+        return error(400, "field 'input' must be a non-empty string or an array of non-empty strings",
+                     "invalid_request_error")
+    if len(items) > MAX_EMBED_INPUTS or sum(len(i) for i in items) > MAX_EMBED_CHARS:
+        return error(413, "embeddings take at most %d inputs and %d characters in one request"
+                     % (MAX_EMBED_INPUTS, MAX_EMBED_CHARS), "invalid_request_error")
+    model_id = body["model"]
+    slot = fleet.index().get(model_id)
+    if slot is not None and "embedding" not in (slot["capabilities"] or []):
+        return error(400, "%s has type %s and cannot embed text. Choose an embedding model."
+                     % (model_id, slot["type"]), "invalid_request_error")
+    try:
+        dev, lock = fleet.route(model_id)
+    except NoDevice as exc:
+        return error(503, str(exc), "model_not_available")
+    with lock.turn(why="embeddings %s" % model_id):
+        try:
+            for attempt in range(BUSY_RETRIES):
+                try:
+                    payload = dev.embeddings(body, timeout=timeout)
+                except device_mod.DeviceBusy:
+                    if attempt == BUSY_RETRIES - 1:
+                        return error(503, "%s stayed busy through %d attempts. Something "
+                                     "outside this app's lock is using the device; "
+                                     "error 150004 means busy, not a bad request."
+                                     % (dev.name, BUSY_RETRIES), "device_busy", {"device": dev.id})
+                    time.sleep(BUSY_BACKOFF * (attempt + 1) + random.random() * 0.3)
+                    continue
+                except device_mod.DeviceTimeout as exc:
+                    return error(504, "%s. Send fewer inputs in one request." % exc,
+                                 "gateway_timeout", {"device": dev.id})
+                except device_mod.DeviceError as exc:
+                    return error(502, "%s: %s" % (dev.name, exc), "device_error", {"device": dev.id})
+                if isinstance(payload, dict):
+                    payload.setdefault("model", model_id)
+                    payload["ainode_pocket"] = {"device": dev.id, "device_name": dev.name}
+                return 200, payload
+        finally:
+            fleet.invalidate(dev.id)
+    return error(503, "no device answered", "model_not_available")
+
+
 def chat_stream(fleet, body, timeout=600, on_device=None):
     """A streaming completion.
 
