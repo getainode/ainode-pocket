@@ -37,6 +37,12 @@ class TestModelsUnion(FakeFleetCase):
         self.assertFalse(glm["ainode_pocket"]["ready"])
         self.assertEqual(glm["ainode_pocket"]["devices"], [self.fakes[1].serial])
 
+    def test_ainode_pocket_block_keys_are_a_contract(self):
+        # Udder and other clients that find Pocket on Bonjour read these keys; add, never rename or drop.
+        for row in gateway.models_payload(self.fleet)["data"]:
+            self.assertEqual(set(row["ainode_pocket"]), {"ready", "chat", "type", "capabilities", "params",
+                                                         "size", "devices", "loaded_on"})
+
     def test_loaded_only_filters(self):
         rows = gateway.models_payload(self.fleet, loaded_only=True)["data"]
         self.assertTrue(rows)
