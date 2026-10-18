@@ -111,7 +111,7 @@ class TestEmbeddingsFraming(ServerCase):
     def test_only_plain_decimal_lengths_are_accepted(self):
         body = json.dumps({"model": MODEL, "input": "hello there"}).encode()
         n = str(len(body))
-        for value in ("+" + n, n[0] + "_" + n[1:], "abc", " " + n):
+        for value in ("+" + n, n[0] + "_" + n[1:], "abc", "-" + n):
             statuses = self.raw("POST /v1/embeddings HTTP/1.1\r\nHost: x\r\nContent-Length: %s\r\n\r\n" % value, body)
             self.assertEqual(len(statuses), 1, (value, statuses))
             self.assertIn(" 400 ", statuses[0], value)
