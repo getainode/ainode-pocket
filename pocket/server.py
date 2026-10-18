@@ -18,9 +18,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import bench as bench_mod
 from . import device as device_mod
 from . import gateway
+from . import multipart
 from .fleet import Fleet, NoDevice
 
 VERSION = "0.1.4"
+MAX_AUDIO_UPLOAD = 25 * 1024 * 1024
 PORT = 8430
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -469,6 +471,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
         try:
+            if path == "/v1/audio/transcriptions":
+                return self.transcribe()
             payload = self.body()
             if payload is None:
                 return self.send_json(400, {"error": {"message": "body must be JSON"}})
@@ -505,6 +509,35 @@ class Handler(BaseHTTPRequestHandler):
             removed = self.fleet.forget(device_id)
             return self.send_json(200 if removed else 404, {"removed": removed})
         return self.send_json(404, {"error": {"message": "no route for " + path}})
+
+    def transcribe(self):
+        def reject(status, message):
+            # Unread bytes must never become another request on this connection.
+            self.close_connection = True
+            return self.send_json(*gateway.error(status, message, "invalid_request_error"))
+
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or self.headers.get("Transfer-Encoding"):
+            return reject(400, "A single Content-Length is required for audio uploads.")
+        try:
+            length = int(lengths[0])
+        except ValueError:
+            return reject(400, "Content-Length must be a non-negative integer.")
+        if length < 0:
+            return reject(400, "Content-Length must be a non-negative integer.")
+        if length > MAX_AUDIO_UPLOAD:
+            return reject(413, "Audio uploads must be 25 MiB or smaller.")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            return reject(400, "Audio upload ended before Content-Length bytes arrived.")
+        try:
+            fields = multipart.parse(self.headers.get("Content-Type", ""), raw)
+        except (ValueError, UnicodeError) as exc:
+            return reject(400, str(exc))
+        status, payload = gateway.transcribe(self.fleet, fields)
+        if status == 200 and fields.get("response_format", "json") == "text":
+            return self.send_text(status, payload)
+        return self.send_json(status, payload)
 
     def chat(self, payload):
         if payload.get("stream"):

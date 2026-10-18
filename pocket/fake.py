@@ -84,6 +84,8 @@ Measured on live hardware on 2026-09-16, for the numbers the chat page shows:
 """
 from __future__ import annotations
 
+from . import multipart
+
 import json
 import socket
 import threading
@@ -649,6 +651,8 @@ class FakeHandler(BaseHTTPRequestHandler):
             return None
         state = self.state
 
+        if path == "/v1/audio/transcriptions":
+            return self._transcribe()
         if path == "/v1/chat/completions":
             return self._chat(self._body())
         if path == "/api/v1/models/unload_all":
@@ -780,6 +784,34 @@ class FakeHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     # -------------------------------------------------------------- inference
+    def _transcribe(self):
+        # Synthetic transcript for offline use, not a recorded device response.
+        fields = multipart.parse(self.headers.get("Content-Type", ""),
+                                 self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        if fields.get("model") not in self.state.loaded:
+            return self._send(404, {"error": {"code": 404, "message": "Model is not loaded."}})
+        if not self.state.inference.acquire(blocking=False):
+            with self.state.guard:
+                self.state.collisions += 1
+            return self._send(200, {"code": 150004, "message": "Device is busy."})
+        try:
+            with self.state.guard:
+                self.state.served += 1
+                self.state.last_transcription = fields
+            time.sleep(self.state.token_delay)
+            text = "This is a fake transcription."
+            if fields.get("response_format", "json") == "text":
+                blob = text.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+                return None
+            return self._send(200, {"text": text})
+        finally:
+            self.state.inference.release()
+
     def _chat(self, body):
         state = self.state
         model_id = body.get("model")

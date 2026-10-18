@@ -38,6 +38,8 @@ open and answering, so neither triggers the fallback.
 """
 from __future__ import annotations
 
+from . import multipart
+
 import glob
 import json
 import os
@@ -392,13 +394,15 @@ class Device:
         return "%s, gateway %s" % (where, self.transport_label)
 
     # ------------------------------------------------------------------ core
-    def _open(self, url, method, body=None, timeout=None, stream=False, host=None):
-        data = json.dumps(body).encode() if body is not None else None
+    def _open(self, url, method, body=None, timeout=None, stream=False, host=None,
+              content_type=None):
+        # Raw uploads supply their own media type; JSON callers keep the old path.
+        data = body if content_type else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request(url, data=data, method=method)
         if self.key:
             req.add_header("Authorization", "Bearer " + self.key)
         if data is not None:
-            req.add_header("Content-Type", "application/json")
+            req.add_header("Content-Type", content_type or "application/json")
         if stream:
             req.add_header("Accept", "text/event-stream")
         if host:
@@ -450,7 +454,8 @@ class Device:
             return True
         return isinstance(exc, DeviceTimeout) and exc.status is None
 
-    def open(self, surface, method, path, body=None, timeout=None, stream=False):
+    def open(self, surface, method, path, body=None, timeout=None, stream=False,
+             content_type=None):
         """Open a response, trying each route this surface allows."""
         routes = self.attempts(surface, path)
         skipped = [p.address for p in self.planes if p.name == PLANE_USB
@@ -466,7 +471,8 @@ class Device:
             if not final:
                 budget = min(budget, PROBE_TIMEOUT)
             try:
-                resp = self._open(root + path, method, body, budget, stream, host)
+                resp = self._open(root + path, method, body, budget, stream, host,
+                                  content_type=content_type)
             except DeviceError as exc:
                 if final or not self._retryable(exc):
                     # Keep the LAN failure's type, status, and detail, while
@@ -587,6 +593,34 @@ class Device:
             resp.close()
 
     # ------------------------------------------------------------ inference
+    def transcribe(self, fields, timeout=600):
+        body, content_type = multipart.encode(fields)
+        resp = self.open("gateway", "POST", "/v1/audio/transcriptions", body,
+                         timeout=timeout, content_type=content_type)
+        try:
+            raw = resp.read().decode("utf-8", "replace")
+        except (socket.timeout, TimeoutError):
+            raise DeviceTimeout("timed out reading transcription after %ss" % timeout) from None
+        except OSError as exc:
+            raise DeviceError("failed reading transcription: %s" % exc) from None
+        finally:
+            resp.close()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            if fields.get("response_format", "json") == "text":
+                return raw
+            raise DeviceError("non-JSON transcription reply: %s" % raw[:120]) from None
+        found = _read_error(payload)
+        if found:
+            code, message = found
+            if code == BUSY_CODE:
+                raise DeviceBusy(message, code=code)
+            raise DeviceError("%s (device code %s)" % (message, code), code=code)
+        if fields.get("response_format", "json") == "text":
+            return payload["text"] if isinstance(payload, dict) and "text" in payload else raw
+        return payload
+
     def chat(self, body, timeout=240):
         return self.gw("POST", "/v1/chat/completions", body, timeout=timeout)
 

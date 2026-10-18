@@ -549,3 +549,12 @@ manifests/             the tiinyapp.farm manifest
 ```
 
 Apache 2.0. Made in Texas.
+
+## Audio transcription
+
+Transcribe audio with an ASR model already loaded on a device. Uploads are limited
+to 25 MiB; the default response is JSON, or add `-F response_format=text` for plain text.
+
+```sh
+curl -F file=@a.wav -F model=Qwen/Qwen3-ASR-1.7B http://127.0.0.1:8430/v1/audio/transcriptions
+```
