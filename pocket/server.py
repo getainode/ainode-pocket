@@ -26,7 +26,10 @@ MAX_AUDIO_UPLOAD = 25 * 1024 * 1024
 # DB-ASR-001: a slow or stalled upload must not hold a handler thread forever.
 UPLOAD_IDLE_SECONDS = 15      # longest gap between received chunks
 UPLOAD_TOTAL_SECONDS = 120    # whole body, about 1.7 Mbit/s for a full 25 MiB upload
-UPLOAD_SLOTS = threading.BoundedSemaphore(4)  # uploads read at once; the rest get 503
+UPLOAD_SLOTS = threading.BoundedSemaphore(4)  # uploads in flight (read, parse, device wait, reply); the rest get 503
+# DB-ASR-002: the request line and headers arrive before any route runs, so the server bounds them itself.
+REQUEST_IDLE_SECONDS = 20    # socket timeout from accept; also ends idle keep-alive connections
+MAX_CONNECTIONS = 64         # handler threads at once; further connections are closed on accept
 PORT = 8430
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -219,6 +222,10 @@ class App:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        self.timeout = REQUEST_IDLE_SECONDS
+        super().setup()
     server_version = "ainode-pocket/" + VERSION
 
     @property
@@ -531,26 +538,29 @@ class Handler(BaseHTTPRequestHandler):
             return reject(400, "Content-Length must be a non-negative integer.")
         if length > MAX_AUDIO_UPLOAD:
             return reject(413, "Audio uploads must be 25 MiB or smaller.")
-        if not UPLOAD_SLOTS.acquire(blocking=False):
+        slots = UPLOAD_SLOTS  # the permit is released on the same semaphore it came from
+        if not slots.acquire(blocking=False):
             self.close_connection = True
             return self.send_json(*gateway.error(
                 503, "Too many audio uploads in progress; retry shortly.", "server_busy"))
         try:
+            # Held through parse, device-lock wait and reply, so in-flight uploads stay bounded.
             raw = self.read_body(length)
+            if raw is None:
+                return reject(408, "Audio upload was too slow or stalled; send the whole file promptly.")
+            if len(raw) != length:
+                return reject(400, "Audio upload ended before Content-Length bytes arrived.")
+            try:
+                fields = multipart.parse(self.headers.get("Content-Type", ""), raw)
+            except (ValueError, UnicodeError) as exc:
+                return reject(400, str(exc))
+            del raw
+            status, payload = gateway.transcribe(self.fleet, fields)
+            if status == 200 and fields.get("response_format", "json") == "text":
+                return self.send_text(status, payload)
+            return self.send_json(status, payload)
         finally:
-            UPLOAD_SLOTS.release()
-        if raw is None:
-            return reject(408, "Audio upload was too slow or stalled; send the whole file promptly.")
-        if len(raw) != length:
-            return reject(400, "Audio upload ended before Content-Length bytes arrived.")
-        try:
-            fields = multipart.parse(self.headers.get("Content-Type", ""), raw)
-        except (ValueError, UnicodeError) as exc:
-            return reject(400, str(exc))
-        status, payload = gateway.transcribe(self.fleet, fields)
-        if status == 200 and fields.get("response_format", "json") == "text":
-            return self.send_text(status, payload)
-        return self.send_json(status, payload)
+            slots.release()
 
     def read_body(self, length):
         """Read exactly length bytes in chunks; None when the client stalls or runs out of time."""
@@ -1062,7 +1072,25 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, app, host="0.0.0.0", port=PORT):
         self.app = app
+        self.connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__((host, port), Handler)
+
+    def process_request(self, request, client_address):
+        # DB-ASR-002: no new handler thread past the cap; the client sees the connection close.
+        if not self.connections.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connections.release()
 
 
 def serve(app, host="0.0.0.0", port=PORT):

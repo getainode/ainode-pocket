@@ -266,8 +266,64 @@ class TestTranscriptions(ServerCase):
                 status, _, payload = self.post()
             finally:
                 sock.close()
+            for _ in range(250):  # leave the patch only after the stalled handler gives its slot back
+                if slots.acquire(blocking=False):
+                    slots.release()
+                    break
+                time.sleep(0.02)
         self.assertEqual(status, 503)
         self.assertIn("Too many audio uploads", payload["error"]["message"])
+
+
+    def test_upload_slot_is_held_through_the_device_call(self):
+        # DB-ASR-001 round 2: the permit covers parse, device wait and reply, not just the read.
+        slots = threading.BoundedSemaphore(1)
+        seen = []
+        real = gateway.transcribe
+
+        def spy(fleet, fields, **kw):
+            seen.append(slots.acquire(blocking=False))
+            return real(fleet, fields, **kw)
+
+        with mock.patch.object(server, "UPLOAD_SLOTS", slots), \
+                mock.patch.object(gateway, "transcribe", spy):
+            status, _, _ = self.post()
+        self.assertEqual((status, seen), (200, [False]))
+        self.assertTrue(slots.acquire(blocking=False))
+
+    def test_connection_that_sends_no_headers_is_closed(self):
+        # DB-ASR-002: the header phase has its own deadline before any route runs.
+        import socket
+        with mock.patch.object(server, "REQUEST_IDLE_SECONDS", 0.3):
+            sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10)
+            try:
+                started = time.monotonic()
+                data = sock.recv(100)
+            finally:
+                sock.close()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertNotIn(b"200 OK", data)
+
+    def test_connections_past_the_cap_are_closed_on_accept(self):
+        import socket
+        self.httpd.connections = threading.BoundedSemaphore(1)
+        first = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10)
+        try:
+            for _ in range(50):
+                if not self.httpd.connections.acquire(blocking=False):
+                    break
+                self.httpd.connections.release()
+                time.sleep(0.02)
+            second = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10)
+            try:
+                second.sendall(b"GET /api/state HTTP/1.1\r\nHost: x\r\n\r\n")
+                self.assertEqual(second.recv(100), b"")
+            except ConnectionResetError:
+                pass
+            finally:
+                second.close()
+        finally:
+            first.close()
 
 
 class TestTranscriptionVhost(TestTranscriptions):
