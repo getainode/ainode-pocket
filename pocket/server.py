@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import socket
 import threading
 import time
 import traceback
@@ -30,6 +31,7 @@ UPLOAD_SLOTS = threading.BoundedSemaphore(4)  # uploads in flight (read, parse, 
 # DB-ASR-002: the request line and headers arrive before any route runs, so the server bounds them itself.
 REQUEST_IDLE_SECONDS = 20    # socket timeout from accept; also ends idle keep-alive connections
 MAX_CONNECTIONS = 64         # handler threads at once; further connections are closed on accept
+HEADER_SECONDS = 30          # absolute limit for request line plus headers, however slowly bytes arrive
 PORT = 8430
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -226,6 +228,32 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         self.timeout = REQUEST_IDLE_SECONDS
         super().setup()
+
+    def handle_one_request(self):
+        # DB-ASR-002 round 3: trickled bytes reset the idle timeout, so the request line and headers
+        # also get an absolute deadline. The timer only lives until the headers are parsed.
+        self.headers_done = False
+        timer = threading.Timer(HEADER_SECONDS, self.header_deadline_passed)
+        timer.daemon = True
+        self.header_timer = timer
+        timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            timer.cancel()
+
+    def parse_request(self):
+        ok = super().parse_request()  # reads the headers
+        self.headers_done = True
+        self.header_timer.cancel()
+        return ok
+
+    def header_deadline_passed(self):
+        if not self.headers_done:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
     server_version = "ainode-pocket/" + VERSION
 
     @property
@@ -1085,6 +1113,13 @@ class Server(ThreadingHTTPServer):
         except Exception:
             self.connections.release()
             raise
+
+    def handle_error(self, request, client_address):
+        # A client that went away (or was cut at the header deadline) is not a server fault.
+        import sys
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
     def process_request_thread(self, request, client_address):
         try:

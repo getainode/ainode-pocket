@@ -326,6 +326,30 @@ class TestTranscriptions(ServerCase):
             first.close()
 
 
+    def test_trickled_headers_hit_the_absolute_deadline(self):
+        # DB-ASR-002 round 3: a byte every 0.1 s never trips the idle timeout, the header deadline ends it.
+        import socket
+        with mock.patch.object(server, "HEADER_SECONDS", 0.6), \
+                mock.patch.object(server, "REQUEST_IDLE_SECONDS", 5):
+            sock = socket.create_connection(("127.0.0.1", self.httpd.server_port), timeout=10)
+            started = time.monotonic()
+            closed = False
+            try:
+                for ch in b"GET /api/state HTTP/1.1\r\nX-Slow: " + b"a" * 200:
+                    sock.sendall(bytes([ch]))
+                    time.sleep(0.1)
+                    if time.monotonic() - started > 4:
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                closed = True
+            finally:
+                sock.close()
+        self.assertTrue(closed)
+        self.assertLess(time.monotonic() - started, 4)
+        status, _, _ = self.post()
+        self.assertEqual(status, 200)
+
+
 class TestTranscriptionVhost(TestTranscriptions):
     fake_kwargs = {"vhost_only": True}
 
