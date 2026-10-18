@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import time
 
 from . import device as device_mod
@@ -208,6 +209,7 @@ def transcribe(fleet, fields, timeout=600):
 
 MAX_EMBED_INPUTS = 256
 MAX_EMBED_CHARS = 1_000_000
+EMBED_LOCK_WAIT = 60  # seconds a request may queue for the device; beyond that it is a 503, not a held handler
 
 
 def embeddings(fleet, body, timeout=120):
@@ -231,7 +233,12 @@ def embeddings(fleet, body, timeout=120):
         dev, lock = fleet.route(model_id)
     except NoDevice as exc:
         return error(503, str(exc), "model_not_available")
-    with lock.turn(why="embeddings %s" % model_id):
+    try:
+        held = lock.acquire(why="embeddings %s" % model_id, timeout=EMBED_LOCK_WAIT)
+    except TimeoutError:
+        return error(503, "%s is busy with other requests; retry shortly." % dev.name, "device_busy",
+                     {"device": dev.id})
+    try:
         try:
             for attempt in range(BUSY_RETRIES):
                 try:
@@ -245,16 +252,22 @@ def embeddings(fleet, body, timeout=120):
                     time.sleep(BUSY_BACKOFF * (attempt + 1) + random.random() * 0.3)
                     continue
                 except device_mod.DeviceTimeout as exc:
-                    return error(504, "%s. Send fewer inputs in one request." % exc,
+                    # Device URLs and bodies stay in the log, never in the reply (Daybreak DB-EMB-003).
+                    print("embeddings: %s timed out: %s" % (dev.name, exc), file=sys.stderr, flush=True)
+                    return error(504, "%s timed out. Send fewer inputs in one request." % dev.name,
                                  "gateway_timeout", {"device": dev.id})
                 except device_mod.DeviceError as exc:
-                    return error(502, "%s: %s" % (dev.name, exc), "device_error", {"device": dev.id})
+                    print("embeddings: %s failed: %s" % (dev.name, exc), file=sys.stderr, flush=True)
+                    return error(502, "%s returned an error; the details are in the Pocket log." % dev.name,
+                                 "device_error", {"device": dev.id})
                 if isinstance(payload, dict):
                     payload.setdefault("model", model_id)
                     payload["ainode_pocket"] = {"device": dev.id, "device_name": dev.name}
                 return 200, payload
         finally:
             fleet.invalidate(dev.id)
+    finally:
+        lock.release(held)
     return error(503, "no device answered", "model_not_available")
 
 

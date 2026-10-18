@@ -7,6 +7,7 @@ dependencies at all.
 from __future__ import annotations
 
 import json
+import re
 import os
 import posixpath
 import socket
@@ -25,6 +26,7 @@ from .fleet import Fleet, NoDevice
 
 VERSION = "0.1.4"
 MAX_EMBED_BODY = 8 * 1024 * 1024
+EMBED_SLOTS = threading.BoundedSemaphore(4)  # embedding requests in flight (read, parse, device wait, reply); the rest get 503
 MAX_AUDIO_UPLOAD = 25 * 1024 * 1024
 # DB-ASR-001: a slow or stalled upload must not hold a handler thread forever.
 UPLOAD_IDLE_SECONDS = 15      # longest gap between received chunks
@@ -527,17 +529,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/audio/transcriptions":
                 return self.transcribe()
-            if path == "/v1/embeddings" and int(self.headers.get("Content-Length") or 0) > MAX_EMBED_BODY:
-                self.close_connection = True  # unread bytes must never become another request
-                return self.send_json(*gateway.error(413, "Embedding requests must be 8 MiB or smaller.",
-                                                     "invalid_request_error"))
+            if path == "/v1/embeddings":
+                return self.embeddings()
             payload = self.body()
             if payload is None:
                 return self.send_json(400, {"error": {"message": "body must be JSON"}})
             if path == "/v1/chat/completions":
                 return self.chat(payload)
-            if path == "/v1/embeddings":
-                return self.send_json(*gateway.embeddings(self.fleet, payload))
             if path == "/api/chat":
                 return self.page_chat(payload)
             if path == "/api/instances/load":
@@ -608,6 +606,38 @@ class Handler(BaseHTTPRequestHandler):
             if status == 200 and fields.get("response_format", "json") == "text":
                 return self.send_text(status, payload)
             return self.send_json(status, payload)
+        finally:
+            slots.release()
+
+    def embeddings(self):
+        """POST /v1/embeddings with the transcription route's framing rules (Daybreak DB-EMB-001/002)."""
+        def reject(status, message, kind="invalid_request_error"):
+            # Unread bytes must never become another request on this connection.
+            self.close_connection = True
+            return self.send_json(*gateway.error(status, message, kind))
+
+        lengths = self.headers.get_all("Content-Length", [])
+        if (len(lengths) != 1 or self.headers.get("Transfer-Encoding")
+                or not re.fullmatch(r"[0-9]{1,10}", lengths[0])):
+            return reject(400, "A single non-negative decimal Content-Length is required.")
+        length = int(lengths[0])
+        if length > MAX_EMBED_BODY:
+            return reject(413, "Embedding requests must be 8 MiB or smaller.")
+        slots = EMBED_SLOTS
+        if not slots.acquire(blocking=False):
+            return reject(503, "Too many embedding requests in progress; retry shortly.", "server_busy")
+        try:
+            raw = self.read_body(length)
+            if raw is None:
+                return reject(408, "The request body was too slow or stalled; send it promptly.")
+            if len(raw) != length:
+                return reject(400, "The request body ended before Content-Length bytes arrived.")
+            try:
+                payload = json.loads(raw)
+            except (ValueError, RecursionError):
+                return reject(400, "body must be JSON")
+            del raw
+            return self.send_json(*gateway.embeddings(self.fleet, payload))
         finally:
             slots.release()
 
