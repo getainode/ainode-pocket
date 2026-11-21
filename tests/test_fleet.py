@@ -284,6 +284,26 @@ class TestPlanes(unittest.TestCase):
         self.assertLessEqual(sock.bind.call_count, 2 * 32768)
         self.assertEqual(sock.close.call_count, sock.bind.call_count)
 
+    def test_expired_link_cache_is_scanned_once_by_many_threads(self):
+        """Regression, 2026-11-21: every request thread ran its own scan and
+        Pocket stopped answering."""
+        scans = []
+
+        def slow_scan():
+            scans.append(1)
+            time.sleep(0.2)
+            return [("usb", "172.30.111.58", "172.30.111.57")]
+
+        with mock.patch.object(device_mod, "host_links", side_effect=slow_scan), \
+                mock.patch.dict(device_mod._LINKS_CACHE, {"at": 0.0, "peers": []}):
+            threads = [threading.Thread(target=device_mod.host_link_peers) for _ in range(16)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            self.assertEqual(device_mod.host_link_peers(), ["172.30.111.57"])
+        self.assertEqual(len(scans), 1)
+
     def test_failed_lan_does_not_fall_through_to_unheld_usb(self):
         dev = device_mod.Device("id", "name", transport="direct", planes=[
             {"name": "usb", "address": "172.30.111.57"},

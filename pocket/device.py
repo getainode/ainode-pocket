@@ -45,6 +45,7 @@ import json
 import os
 import re
 import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -725,6 +726,7 @@ def host_links():
 
 
 _LINKS_CACHE = {"at": 0.0, "peers": []}
+_LINKS_LOCK = threading.Lock()
 LINKS_TTL = 30.0
 
 
@@ -734,10 +736,15 @@ def host_link_peers(force=False):
     Reading them binds at most 32768 sockets per known /16, and telemetry asks
     often, so the answer is held briefly. Cable changes are noticed within the TTL.
     """
-    now = _now()
-    if force or now - _LINKS_CACHE["at"] > LINKS_TTL:
-        _LINKS_CACHE["peers"] = [peer for _, _, peer in host_links()]
-        _LINKS_CACHE["at"] = now
+    if not force and _now() - _LINKS_CACHE["at"] <= LINKS_TTL:
+        return _LINKS_CACHE["peers"]
+    # One scan at a time. Without the lock every request thread that found the
+    # cache expired ran its own 65536-bind scan; under the GIL those slowed
+    # each other past the TTL, so the cache never refilled and every call hung.
+    with _LINKS_LOCK:
+        if force or _now() - _LINKS_CACHE["at"] > LINKS_TTL:
+            _LINKS_CACHE["peers"] = [peer for _, _, peer in host_links()]
+            _LINKS_CACHE["at"] = _now()
     return _LINKS_CACHE["peers"]
 
 
