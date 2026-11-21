@@ -149,6 +149,20 @@ class TestTelemetry(FakeFleetCase):
         self.assertFalse(thermal["verified"])
         self.assertIn("no temperature", thermal["reason"])
 
+    def test_missing_status_route_keeps_the_unit_online(self):
+        """The SSH Beta AI-Box answers 404 on /api/v1/sys/status (2026-11-21)."""
+        dev = self.fleet.get(self.fake.serial)
+        gone = device_mod.DeviceError("HTTP 404", status=404)
+        with mock.patch.object(dev, "sys_status", side_effect=gone):
+            payload = self.fleet.telemetry(self.fake.serial, force=True)
+        self.assertTrue(payload["online"])
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["npu_units"]["total"], 100)
+        self.assertIsNone(payload["memory"]["total_bytes"])
+        down = device_mod.DeviceError("HTTP 502", status=502)
+        with mock.patch.object(dev, "sys_status", side_effect=down):
+            self.assertFalse(self.fleet.telemetry(self.fake.serial, force=True)["online"])
+
     def test_offline_device_reports_the_error_not_a_crash(self):
         fleet = Fleet(Registry(os.path.join(self.workdir, "other.json")))
         fleet.register("127.0.0.1", key="k", name="dead", device_id="dead",
