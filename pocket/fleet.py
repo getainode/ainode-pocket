@@ -511,7 +511,16 @@ class Fleet:
         try:
             units = dev.npu_units()
             running = dev.running()
-            status = dev.sys_status()
+            try:
+                status = dev.sys_status()
+            except device_mod.DeviceError as exc:
+                # The SSH Beta AI-Box (Go build) has no /api/v1/sys/status. The
+                # gateway calls above answered, so the unit is up; only the
+                # host numbers are missing, and they are reported as unknown.
+                if exc.status != 404:
+                    raise
+                status = {}
+                value["status_route"] = "missing on this AI-Box"
             value["online"] = True
             total = units.get("npu_total") or 100
             used = units.get("npu_used") or 0
